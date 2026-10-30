@@ -2,6 +2,7 @@ import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { TextRetainer } from '@deepseek-ai/dsh-output-retention'
 import { unsupportedModel, provideWorkingDirectoryFixture, unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
@@ -27,6 +28,7 @@ const contexts: Context[] = []
 let callNumber = 0
 
 afterEach(async () => {
+  vi.useRealTimers()
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
   vi.restoreAllMocks()
 })
@@ -124,6 +126,11 @@ class StubTerminalSession implements TerminalBackendSession {
   historyTruncated = false
   throwOnSend = false
   largeOutput = 'x'.repeat(100)
+  fallbackChunks?: (start: string, end: string, wrapper: string) => string[]
+  fallbackQueue: string[] = []
+  fallbackEnd: 'stdin_read' | 'session_exit' | 'timeout' = 'stdin_read'
+  fallbackViewport = ''
+  fallbackTruncated = false
   statusChunks: string[] = []
 
   constructor(mode: StubMode) {
@@ -132,6 +139,26 @@ class StubTerminalSession implements TerminalBackendSession {
 
   startSend(request: TerminalSendRequest): TerminalSendOperation {
     this.sends += 1
+    if (this.fallbackChunks !== undefined) {
+      if (request.text.length > 0) {
+        const start = /__DSH_PERSISTENT_PWSH_START_[^_]+__/.exec(request.text)![0]
+        const end = /__DSH_PERSISTENT_PWSH_END_[^:]+:/.exec(request.text)![0]
+        this.fallbackQueue = this.fallbackChunks(start, end, request.text)
+      }
+      const delta = this.fallbackQueue.shift() ?? ''
+      const last = this.fallbackQueue.length === 0
+      if (last && this.fallbackEnd === 'session_exit') this.statusValue = { kind: 'exited', exitCode: 9, signal: null }
+      const done = last && this.fallbackEnd === 'timeout'
+        ? new Promise<ReturnType<StubTerminalSession['result']>>((resolve) => {
+          request.signal!.addEventListener('abort', () => { resolve(this.result('', 'timeout')) }, { once: true })
+        })
+        : Promise.resolve(this.result(this.fallbackViewport, last ? this.fallbackEnd : 'inferred_idle'))
+      return {
+        done,
+        readOutput: () => ({ delta, truncated: this.fallbackTruncated }),
+        cancel: () => false,
+      }
+    }
     if (this.mode === 'send-error') throw new Error('stub send failed')
     if (this.throwOnSend) throw new Error('PTY session has exited')
     if (this.mode === 'wait-for-abort' || this.mode === 'end-on-abort') {
@@ -336,6 +363,127 @@ async function setup(
 }
 
 describe('tool-pwsh-persistent', () => {
+  it.each(['stdin_read', 'session_exit', 'timeout'] as const)(
+    'bounds incremental fallback before %s settlement and reports the retained tail',
+    async (ending) => {
+      const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: 10, timeoutMs: 1_000 })
+      await call(ctx, owner, 'warm up')
+      const session = stub.sessions[0]!
+      session.scrollback = ''
+      session.fallbackEnd = ending
+      let budget = 0
+      session.fallbackChunks = (start, end) => {
+        budget = 3 * 10 + start.length + end.length + 4
+        return [start.slice(0, 23), start.slice(23) + '\n', ...Array.from({ length: 8 }, () => 'x'.repeat(80)), 'FINAL-TAIL']
+      }
+      const sizes: number[] = []
+      // oxlint-disable-next-line typescript/unbound-method -- call(this, chunk) mempertahankan penerima asli.
+      const push = TextRetainer.prototype.push
+      vi.spyOn(TextRetainer.prototype, 'push').mockImplementation(function (this: TextRetainer, chunk) {
+        const decision = push.call(this, chunk)
+        sizes.push(Buffer.byteLength(this.finish().text))
+        return decision
+      })
+      vi.useFakeTimers()
+      const pending = call(ctx, owner, 'bounded fallback')
+      await vi.runAllTimersAsync()
+      const rendered = text(await pending)
+      vi.useRealTimers()
+      expect(sizes.length).toBeGreaterThanOrEqual(8)
+      expect(Math.max(...sizes)).toBeLessThanOrEqual(budget)
+      expect(rendered).toContain('FINAL-TAIL')
+      expect(rendered).toContain('fallback retention limit')
+      expect(rendered).not.toContain('__DSH_')
+      if (ending === 'session_exit') expect(rendered).toContain('[shell exited: code 9]')
+      if (ending === 'timeout') expect(rendered).toContain('Your command timed out')
+      if (ending !== 'stdin_read') expect(session.closed).not.toEqual([])
+    },
+  )
+
+  it.each([1, 2, 10])('keeps a safe Unicode tail with limit %i after one large delta', async (limit) => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: limit })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.scrollback = ''
+    session.fallbackChunks = start => [start + '\n' + '界😀'.repeat(200) + 'Z']
+    const rendered = text(await call(ctx, owner, 'unicode fallback'))
+    expect(rendered).toContain('fallback retention limit')
+    const payload = rendered.slice(rendered.indexOf('\n') + 1).split('<response clipped>')[0]!
+    expect(payload.length).toBeLessThanOrEqual(limit)
+    expect(payload.endsWith('Z')).toBe(true)
+    expect(payload.isWellFormed()).toBe(true)
+    expect(payload).not.toContain('�')
+  })
+
+  it('saturates retention arithmetic for the largest accepted output limit', async () => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: Number.MAX_SAFE_INTEGER })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.scrollback = ''
+    session.fallbackChunks = start => [start + '\nhello']
+    expect(text(await call(ctx, owner, 'large config'))).toBe('hello')
+  })
+
+  it('keeps exact-limit output and joins a surrogate pair split between deltas', async () => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: 3 })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.scrollback = ''
+    session.fallbackChunks = start => [start + '\n\uD83D', '\uDE00Z']
+    expect(text(await call(ctx, owner, 'exact unicode'))).toBe('😀Z')
+  })
+
+  it.each([0, 1, 20, 60])('does not expose START nonce fragments at retention cut %i', async (extra) => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: 10 })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.scrollback = ''
+    session.fallbackChunks = (start, end) => [start + '\n' + 'a'.repeat(30 + end.length + 4 + extra)]
+    const rendered = text(await call(ctx, owner, 'nonce cut'))
+    expect(rendered).not.toMatch(/[0-9]|__|DSH/)
+    expect(rendered).toContain('a'.repeat(10))
+  })
+
+  it.each([false, true, 'missing-status'] as const)('excludes a huge trailer after END, split=%s', async (split) => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: 10 })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.scrollback = ''
+    session.fallbackEnd = 'session_exit'
+    session.fallbackChunks = (start, end) => split === 'missing-status'
+      ? [start + '\nhello\n' + end + '\n' + 'trailer'.repeat(1_000)]
+      : split
+        ? [start + '\nhello\n' + end.slice(0, 20), end.slice(20), '0\n' + 'trailer'.repeat(1_000), 'more trailer']
+        : [start + '\nhello\n' + end + '0\n' + 'trailer'.repeat(1_000)]
+    const rendered = text(await call(ctx, owner, 'trailer'))
+    expect(rendered.startsWith('hello\n[shell exited: code 9]')).toBe(true)
+    expect(rendered).not.toContain('trailer')
+    expect(rendered).not.toContain('<response clipped>')
+  })
+
+  it('replaces fallback on empty delta while keeping upstream truncation', async () => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: 100 })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.scrollback = ''
+    session.fallbackChunks = (start) => {
+      session.fallbackViewport = start + '\nreplacement'
+      return [start + '\n' + 'old'.repeat(1_000), '']
+    }
+    expect(text(await call(ctx, owner, 'replace viewport'))).toBe('replacement')
+    session.fallbackTruncated = true
+    expect(text(await call(ctx, owner, 'upstream truncated'))).toContain('<response clipped>')
+  })
+
+  it('excludes a long split wrapper echo once the real START arrives', async () => {
+    const { ctx, owner, stub } = await setup({ backendType: 'stub', maxOutputChars: 10 })
+    await call(ctx, owner, 'warm up')
+    const session = stub.sessions[0]!
+    session.scrollback = ''
+    session.fallbackChunks = (start, _end, wrapper) => [wrapper.slice(0, 100), wrapper.slice(100), '\n' + start.slice(0, 30), start.slice(30) + '\nhello']
+    expect(text(await call(ctx, owner, 'echo ' + 'x'.repeat(10_000)))).toBe('hello')
+  })
+
   it('registers a configurable schema and reuses one owner shell', async () => {
     const { ctx, owner, stub, fiber } = await setup({
       backendType: 'stub',

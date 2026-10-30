@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.2-alpha.2/persistent-shell-fallback-tail/guide.md
+/:
+  en: f1afbb5e44d2305e
+  zh: 565432dfcb0f0b84
+/persistent-shell-fallback-keeps-a-bounded-tail:
+  en: d38006dba98ac69d
+  zh: c13ab70d5bb908f3
+/persistent-shell-fallback-keeps-a-bounded-tail/change:
+  en: 1dba5a430f466f26
+  zh: af2ccc5bc3721d26
+/persistent-shell-fallback-keeps-a-bounded-tail/migration:
+  en: 95ca297bedfc2099
+  zh: 759db6bc9d9ef7a9
