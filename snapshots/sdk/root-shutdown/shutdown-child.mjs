@@ -1,7 +1,7 @@
 /** Menahan Agent milik plugin hingga root shutdown membatalkannya. */
 export const inject = ['agents', 'loader']
 
-/** @param {import('@deepseek-ai/cordis').Context} ctx - Runtime fixture. */
+/** @param {import('@deepseek-ai/cordis').Context} ctx - Konteks runtime fixture. */
 export async function apply(ctx) {
   const { SessionId } = await ctx.loader.import('@deepseek-ai/dsh-session')
   const { createUserMessage } = await ctx.loader.import('@deepseek-ai/dsh-llm')
