@@ -1,5 +1,6 @@
 import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import { setImmediate } from 'node:timers/promises'
+import { getEventListeners } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -409,4 +410,63 @@ it('cancels independent persisted Agents before waiting for either one to stop',
   for (const release of releases) release.resolve(undefined)
   await Promise.all(work)
   await disposal
+})
+
+it.each([
+  ['create', 'caller'], ['resume', 'caller'],
+  ['create', 'factory'], ['resume', 'factory'],
+  ['create', 'provider'], ['resume', 'provider'],
+] as const)('detaches creation cancellation after %s while retaining %s disposal', async (operation, disposalOwner) => {
+  const ctx = new Context()
+  const root = mkdtempSync(join(tmpdir(), 'dsh-creation-signal-'))
+  onTestFinished(async () => {
+    await ctx.fiber.dispose()
+    await ctx.fiber.await()
+    rmSync(root, { recursive: true, force: true })
+  })
+  await mountAgentLoopTestDependencies(ctx)
+  const persistence = await ctx.plugin(JsonlSessionPersistence, { root })
+  const loop = await ctx.plugin(AgentLoop, { agents: [] })
+  ctx.llm.registerAdapter(['mock'], new MockAdapter([textResponse('still live')]))
+  let ownerCtx!: Context
+  const owner = await ctx.plugin(Object.assign((inner: Context) => { ownerCtx = inner }, { inject: ['agents'] }))
+  const sessionId = SessionId('creation-signal')
+  if (operation === 'resume') {
+    const seed = await ctx.agents.create({ sessionId })
+    seed.agent.inject(createUserMessage({ content: [{ type: 'text', text: 'seed' }], source: { kind: 'user' } }))
+    await seed.dispose()
+  }
+  let acquisitionSignal: AbortSignal | undefined
+  if (operation === 'create') {
+    const create = ctx.sessionPersistence.create.bind(ctx.sessionPersistence)
+    vi.spyOn(ctx.sessionPersistence, 'create').mockImplementation((header, options) => {
+      acquisitionSignal = options?.signal
+      return create(header, options)
+    })
+  } else {
+    const open = ctx.sessionPersistence.open.bind(ctx.sessionPersistence)
+    vi.spyOn(ctx.sessionPersistence, 'open').mockImplementation((id, access, options) => {
+      acquisitionSignal = options?.signal
+      return open(id, access, options)
+    })
+  }
+  const controller = new AbortController()
+  const agentOptions = { provider: 'mock', model: 'mock' }
+  const handle = operation === 'create'
+    ? await ownerCtx.agents.create({ sessionId, agentOptions, signal: controller.signal })
+    : await ownerCtx.agents.resume({ resumeSessionId: sessionId, agentOptions, signal: controller.signal })
+  if (acquisitionSignal === undefined) throw new Error('acquisition did not receive its cancellation signal')
+  expect.soft(getEventListeners(acquisitionSignal, 'abort')).toEqual([])
+  controller.abort(new Error('creation caller no longer needs its signal'))
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'continue' }], source: { kind: 'user' } }))
+  await handle.agent.whenIdle()
+  expect(handle.agent.session.snapshotEvents().at(-1)).toMatchObject({ type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  expect(ctx.agents.get(sessionId)).toBe(handle.agent)
+  const disposal = disposalOwner === 'caller' ? owner : disposalOwner === 'factory' ? loop : persistence
+  await disposal.dispose()
+  expect(ctx.agents.get(sessionId)).toBeUndefined()
+  if (disposalOwner === 'provider') await ctx.plugin(JsonlSessionPersistence, { root })
+  const reopened = await ctx.sessionPersistence.open(sessionId, 'write')
+  expect((await reopened.read()).events).toEqual(handle.agent.session.snapshotEvents())
+  await reopened.close()
 })

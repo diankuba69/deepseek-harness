@@ -594,7 +594,7 @@ export class AgentLoop extends Service implements AgentFactory {
       const agent = machine
       assertLive()
 
-      return await agent.runMaintenance(async () => {
+      const handle = await agent.runMaintenance(async () => {
         publication = Promise.withResolvers<void>()
         try {
           assertLive()
@@ -623,6 +623,8 @@ export class AgentLoop extends Service implements AgentFactory {
           publication = undefined
         }
       })
+      callerSignal?.removeEventListener('abort', onCallerAbort)
+      return handle
     } catch (error: unknown) {
       await dispose().catch((disposeError: unknown) => {
         // Error inisialisasi tetap utama setelah cleanup selesai; kegagalan drain tetap dilaporkan.
@@ -706,6 +708,7 @@ export class AgentLoop extends Service implements AgentFactory {
     this.ownership.trackWrapper(published)
     try {
       const handle = await raceAbort(published, signal, id)
+      signal.removeEventListener('abort', stop)
       return {
         agent: handle.agent,
         async dispose() {

@@ -15,6 +15,6 @@ AgentLoop 保留持久化后端，直到其 Agent（智能体）结束且写句�
 
 ## 迁移
 
-1. 自定义 `SessionPersistence` 提供方 必须使被取消的 `create` 和 `open` 调用结束，并支持不可取消的 `SessionHandle.close()`。遵守传入的 `AbortSignal`，避免关闭等待无界后端操作。
+1. 保持现有 `SessionPersistence` 取消约定：`create` 和 `open` 在后端工作开始前观察传入的 `AbortSignal`；不保证取消已经运行的工作。释放会等待这些操作结束及不可取消的 `SessionHandle.close()` 完成，因此规划关闭时限时需要考虑后端现有的操作限制。
 2. 替换所有者资源前等待其释放；替换后端后，显式恢复仍需要的已停止 Agent。
 3. 以写模式重新打开会话，检查最终 `turn/end` 和已取消收件箱事件，验证有序关闭。Session 格式和现有持久文件不变。
