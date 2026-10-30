@@ -42,11 +42,9 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
-/* v8 ignore start -- composes secondary cleanup-failure messages, which require a filesystem/kernel fault after the primary failure. */
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
-/* v8 ignore stop */
 
 function isPermissionError(error: unknown): boolean {
   return error instanceof Error && 'code' in error && (error.code === 'EACCES' || error.code === 'EPERM')
@@ -545,8 +543,7 @@ async function removeStagingDirOrThrow(
   try {
     await removeStagingDir(stagingDir)
   } catch (cleanupError: unknown) {
-    /* v8 ignore next 1 -- cleanup failure here needs a second filesystem fault after the primary write failure. */
-    throw new FsError(`write failed (${errorMessage(originalError)}) and temp cleanup failed (${errorMessage(cleanupError)})`, 'FS_NOT_FOUND', { cause: originalError })
+    throw new FsError(`write failed (${errorMessage(originalError)}) and temp cleanup failed (${errorMessage(cleanupError)})`, 'FS_IO_ERROR', { cause: originalError })
   }
   throw originalError
 }
@@ -603,7 +600,9 @@ function writeIoError(path: string, error: unknown): unknown {
  * POSIX protects the staging directory and file with `0o700` and `0o600`. A new Windows file
  * inherits the destination directory's DACL; a replacement copies the existing target's DACL
  * onto the empty temp before writing and preserves the target descriptor at publication.
- * Node write errors become FsError; permission refusals use FS_PERMISSION_DENIED and other I/O uses FS_IO_ERROR.
+ * Error tulis Node menjadi FsError; penolakan izin memakai FS_PERMISSION_DENIED dan I/O lain memakai FS_IO_ERROR.
+ * Kegagalan tulis disertai kegagalan close atau pembersihan staging memakai FS_IO_ERROR,
+ * mempertahankan cause utama dan detail kegagalan kedua di pesan; target belum dipublikasikan.
  * @param absolutePath - destination; missing parent directories are created.
  * @param content - the full UTF-8 text to write.
  * @param mode - POSIX mode to apply, or undefined to retain the new-file default.
@@ -688,12 +687,11 @@ export async function writeFileAtomic(
   } catch (error: unknown) {
     /* v8 ignore next -- abort-mid-write needs a writeFile/signal race; the non-abort (rename/open) side is tested. */
     let failure: unknown = isAbortError(error) ? new FsError('write aborted', 'FS_ABORTED') : writeIoError(displayPath, error)
-    /* v8 ignore next 8 -- reached only if writeFile/sync throws with the handle open (IO fault); close-failure is a double fault. */
     if (handle) {
       try {
         await handle.close()
       } catch (closeError: unknown) {
-        failure = new FsError(`write failed (${errorMessage(failure)}) and temp close failed (${errorMessage(closeError)})`, 'FS_NOT_FOUND', { cause: failure })
+        failure = new FsError(`write failed (${errorMessage(failure)}) and temp close failed (${errorMessage(closeError)})`, 'FS_IO_ERROR', { cause: failure })
       }
     }
     if (!stagingCreated) throw failure

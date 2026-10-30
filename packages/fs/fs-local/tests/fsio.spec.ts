@@ -5,7 +5,7 @@
  * policy and lives in `dsh-fs-observation-policy`, so it is not tested here.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { chmod, mkdtemp, readFile, rename, rm, stat, symlink, unlink, writeFile, mkdir, readdir, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, parse, relative, resolve } from 'node:path'
@@ -891,6 +891,83 @@ describe('writeFileAtomic — temp-file safety', () => {
     }, { displayPath: file, createIfAbsent: true })).resolves.toBeUndefined()
     expect(await readFile(file, 'utf8')).toBe('ours')
   })
+
+  it.each(['error', 'string'] as const)('reports publication and %s staging-cleanup failures as I/O errors while preserving the target', async (kind) => {
+    const file = join(dir, 'a.txt')
+    const stagingDir = join(dir, '.failed-publication.tmpdir')
+    await writeFile(file, 'old')
+    const publicationFailure = Object.assign(new Error('replacement denied'), { code: 'EACCES' })
+    const cleanupFailure = kind === 'error' ? new Error('staging removal denied') : 'staging removal denied'
+
+    const failure = await writeFileAtomic(file, 'new', 0o600, undefined, {
+      platform: 'win32',
+      tempDirName: () => '.failed-publication.tmpdir',
+      copyFileDacl: () => Promise.resolve(),
+      replaceFile: async () => { throw publicationFailure },
+      removeStagingDir: async () => { throw cleanupFailure },
+    }).catch((error: unknown) => error)
+
+    expect(await readFile(file, 'utf8')).toBe('old')
+    expect(await readFile(join(stagingDir, 'a.txt.tmp'), 'utf8')).toBe('new')
+    if (posixModes) expect((await stat(stagingDir)).mode & 0o777).toBe(0o700)
+    expect(failure).toMatchObject({
+      code: 'FS_IO_ERROR',
+      cause: { code: 'FS_PERMISSION_DENIED', cause: publicationFailure },
+    })
+    expect(failure).toHaveProperty('message', expect.stringContaining('permission denied'))
+    expect(failure).toHaveProperty('message', expect.stringContaining('staging removal denied'))
+  })
+
+  it.each(['writeFile', 'sync'] as const)(
+    'reports %s and close failures as I/O errors, preserves the target, and removes staging', async (operation) => {
+      const file = join(dir, 'a.txt')
+      const tempPath = join(dir, '.failed-write.tmpdir', 'a.txt.tmp')
+      await writeFile(file, 'old')
+      const primaryFailure = Object.assign(new Error(`${operation} failed`), { code: 'EIO' })
+      const closeFailure = new Error('temp close failed')
+      let stagedHandle: import('node:fs/promises').FileHandle | undefined
+      vi.resetModules()
+      onTestFinished(() => {
+        vi.doUnmock('node:fs/promises')
+        vi.resetModules()
+      })
+      vi.doMock('node:fs/promises', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('node:fs/promises')>()
+        return {
+          ...actual,
+          async open(...args: Parameters<typeof actual.open>) {
+            const handle = await actual.open(...args)
+            if (args[0] !== tempPath) return handle
+            stagedHandle = handle
+            const close = handle.close.bind(handle)
+            onTestFinished(async () => {
+              vi.restoreAllMocks()
+              await close()
+            })
+            vi.spyOn(handle, operation).mockRejectedValueOnce(primaryFailure)
+            // Kegagalan close dapat dilaporkan sesudah descriptor sudah ditutup.
+            vi.spyOn(handle, 'close').mockImplementationOnce(async () => {
+              await close()
+              throw closeFailure
+            })
+            return handle
+          },
+        }
+      })
+      const { writeFileAtomic: isolatedWriteFileAtomic } = await import('../src/fsio.ts')
+
+      const failure = await isolatedWriteFileAtomic(file, 'new', 0o600, undefined, {
+        tempDirName: () => '.failed-write.tmpdir',
+      }).catch((error: unknown) => error)
+
+      expect(await readFile(file, 'utf8')).toBe('old')
+      expect(await readdir(dir)).toEqual(['a.txt'])
+      expect(stagedHandle?.fd).toBe(-1)
+      expect(failure).toMatchObject({ code: 'FS_IO_ERROR', cause: { code: 'FS_IO_ERROR', cause: primaryFailure } })
+      expect(failure).toHaveProperty('message', expect.stringContaining(primaryFailure.message))
+      expect(failure).toHaveProperty('message', expect.stringContaining(closeFailure.message))
+    },
+  )
 
   it.skipIf(!posixModes)('creates new files owner-only by default', async () => {
     const file = join(dir, 'a.txt')
