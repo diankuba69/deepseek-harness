@@ -137,6 +137,20 @@ interface ObservedSession {
   fingerprint: string
 }
 
+interface CommittedLiveObservation {
+  cursor: SessionLogOffset
+  fingerprint: string
+  bindingIdentity: symbol
+}
+
+type ObservedLiveSession = {
+  session: Session
+  cursor: SessionLogOffset
+} & (
+  | (ObservedSession & { kind: 'full' })
+  | { kind: 'unchanged'; header: SessionHeader; fingerprint: string }
+)
+
 interface ObservedPersistedSession {
   header: SessionHeader
   revision: SessionPersistenceRevision
@@ -151,7 +165,7 @@ interface PersistenceBinding {
 interface Observation {
   persistenceBinding: PersistenceBinding
   persisted: Map<SessionId, ObservedPersistedSession>
-  live: Map<SessionId, ObservedSession>
+  live: Map<SessionId, ObservedLiveSession>
 }
 
 interface IndexedPersistedRow {
@@ -234,6 +248,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _persistenceEpoch = 0
   private _globalGeneration = 0
   private _localGeneration = 0
+  // Hanya bukti indeks committed; WeakMap tidak menahan riwayat atau Session yang sudah dilepas.
+  private _committedLive = new WeakMap<Session, CommittedLiveObservation>()
   private _tail: Promise<void> = Promise.resolve()
   private _closed = false
   private _closePromise: Promise<void> | undefined
@@ -355,6 +371,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
     this._db?.close()
     this._db = undefined
+    this._committedLive = new WeakMap()
   }
 
   private async _open(): Promise<void> {
@@ -415,7 +432,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     ).all() as unknown as IndexedLiveRow[]
     const persistedById = new Map(persistedRows.map(row => [row.id as SessionId, row]))
     const liveById = new Map(liveRows.map(row => [row.id as SessionId, row]))
-    const observation = await this._observeStable(persistedById, signal)
+    const observation = await this._observeStable(persistedById, liveById, signal)
     assertNotAborted(signal)
     const persistentChanges = observation.persistenceBinding.service === undefined
       ? []
@@ -423,7 +440,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const persistentDeletes = observation.persistenceBinding.service === undefined
       ? []
       : persistedRows.filter(row => !observation.persisted.has(row.id as SessionId))
-    const liveChanges = [...observation.live.values()].filter((entry) => {
+    const liveChanges = [...observation.live.values()].filter((entry): entry is Extract<ObservedLiveSession, { kind: 'full' }> => {
+      if (entry.kind === 'unchanged') return false
       const indexed = liveById.get(entry.header.id)
       const persisted = observation.persisted.has(entry.header.id) ? 1 : 0
       return indexed?.fingerprint !== entry.fingerprint || indexed.persisted !== persisted
@@ -489,11 +507,19 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     if (pointerChanged) this._persistenceEpoch += 1
     this._localGeneration = nextLocalGeneration
     this._lastPersistenceIdentity = observation.persistenceBinding.identity
+    for (const entry of observation.live.values()) {
+      this._committedLive.set(entry.session, {
+        cursor: entry.cursor,
+        fingerprint: entry.fingerprint,
+        bindingIdentity: observation.persistenceBinding.identity,
+      })
+    }
     return observation.persistenceBinding
   }
 
   private async _observeStable(
     indexed: ReadonlyMap<SessionId, IndexedPersistedRow>,
+    indexedLive: ReadonlyMap<SessionId, IndexedLiveRow>,
     signal: AbortSignal | undefined,
   ): Promise<Observation> {
     for (let attempt = 0; attempt < STABLE_OBSERVATION_ATTEMPTS; attempt += 1) {
@@ -545,12 +571,21 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           )
         }
       }
-      const live = new Map<SessionId, ObservedSession>()
+      const live = new Map<SessionId, ObservedLiveSession>()
       for (const session of this.ctx.sessions.list()) {
-        const observed = observeLive(session)
         const durable = persisted.get(session.id)
-        if (durable !== undefined) assertSessionHeadersCompatible(observed.header, durable.header)
-        live.set(session.id, observed)
+        if (durable !== undefined) assertSessionHeadersCompatible(session.header, durable.header)
+        // Cursor diambil bersama observasi, bukan saat commit yang bisa menyusul append baru.
+        const cursor = session.seq
+        const committed = this._committedLive.get(session)
+        const row = indexedLive.get(session.id)
+        const reusable = committed?.cursor === cursor
+          && committed.bindingIdentity === persistenceBinding.identity
+          && row?.fingerprint === committed.fingerprint
+          && row.persisted === (durable === undefined ? 0 : 1)
+        live.set(session.id, reusable
+          ? { kind: 'unchanged', session, cursor, header: session.header, fingerprint: committed.fingerprint }
+          : { kind: 'full', session, cursor, ...observeLive(session) })
       }
       if (!sameSessionIds(initiallyLive, live)) continue
       return { persistenceBinding, persisted, live }
@@ -926,7 +961,7 @@ function samePersistenceSnapshots(
 
 function sameSessionIds(
   before: ReadonlySet<SessionId>,
-  after: ReadonlyMap<SessionId, ObservedSession>,
+  after: ReadonlyMap<SessionId, ObservedLiveSession>,
 ): boolean {
   if (before.size !== after.size) return false
   for (const id of before) {
