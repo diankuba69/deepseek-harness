@@ -468,21 +468,24 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     await ctx.fiber.dispose()
   })
 
-  it('a resume read failure swallows a rejecting handle close during rollback', async () => {
+  it('a resume read failure remains primary while a rollback close failure is reported', async () => {
     const sessionId = SessionId('resume-read-close-reject')
     const root = await persistSession(sessionId)
     const ctx = await mountPersistentHarness(root, new MockAdapter([]))
     const originalOpen = ctx.sessionPersistence.open.bind(ctx.sessionPersistence)
     const spies: Array<{ mockRestore: () => void }> = []
+    const closeFailure = new Error('close failed')
+    const report = vi.spyOn(ctx.logger, 'error')
     ctx.sessionPersistence.open = async (id, access, options) => {
       const handle = await originalOpen(id, access, options)
       spies.push(vi.spyOn(handle, 'read').mockRejectedValue(new Error('stored read failed')))
-      spies.push(vi.spyOn(handle, 'close').mockRejectedValue(new Error('close failed')))
+      spies.push(vi.spyOn(handle, 'close').mockRejectedValue(closeFailure))
       return handle
     }
 
     await expect(ctx.agents.resume({ resumeSessionId: sessionId }))
       .rejects.toThrow('stored read failed')
+    expect(report).toHaveBeenCalledWith(closeFailure)
     expect(ctx.agents.get(sessionId)).toBeUndefined()
     expect(ctx.sessions.get(sessionId)).toBeUndefined()
 
@@ -874,7 +877,7 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     await ctx.fiber.dispose()
   })
 
-  it('owner unload aborts a never-settling persistence open, releases the identity, and blocks late publication', async () => {
+  it('owner unload rejects resume promptly and waits for the abandoned open to close', async () => {
     const sessionId = SessionId('resume-load-owner-unload')
     const root = await persistSession(sessionId)
     const ctx = await mountPersistentHarness(root, new MockAdapter([textResponse('next')]))
@@ -903,24 +906,20 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     await openStarted.promise
 
     const rejection = expect(promptly(resuming)).rejects.toThrow(/owner disposed during setup/)
-    await promptly(owner.dispose())
+    let disposed = false
+    const disposal = owner.dispose().then(() => { disposed = true })
+    await rejection
+    expect(disposed).toBe(false)
     expect(published).toEqual([])
     expect(ctx.agents.get(sessionId)).toBeUndefined()
     expect(ctx.sessions.get(sessionId)).toBeUndefined()
 
-    // owner.dispose() awaited transaction settlement, so the same identities
-    // can be reused before awaiting the public rejection.
-    const retry = await promptly(ctx.agents.resume({ resumeSessionId: sessionId, agentOptions: { provider: 'mock', model: 'mock' } }))
-    await rejection
-    expect(opens).toBe(2)
-    expect(published).toEqual(['session/created', 'agent/created'])
-
-    // Settlement of the abandoned backend open cannot resume the old
-    // transaction: the late handle is closed, and no second publication lands
-    // after the retry owns the ids.
     const abandoned = abandonedHandleStub()
     lateOpen.resolve(abandoned.handle)
-    await expect.poll(() => abandoned.close.mock.calls.length).toBe(1)
+    await promptly(disposal)
+    expect(abandoned.close).toHaveBeenCalledTimes(1)
+    const retry = await promptly(ctx.agents.resume({ resumeSessionId: sessionId, agentOptions: { provider: 'mock', model: 'mock' } }))
+    expect(opens).toBe(2)
     expect(ctx.agents.get(sessionId)).toBe(retry.agent)
     expect(ctx.sessions.get(sessionId)).toBe(retry.agent.session)
     expect(published).toEqual(['session/created', 'agent/created'])
@@ -929,7 +928,7 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     await ctx.fiber.dispose()
   })
 
-  it('AgentLoop unload aborts a never-settling persistence open and awaits wrapper settlement', async () => {
+  it('AgentLoop unload rejects resume promptly and awaits late handle cleanup', async () => {
     const sessionId = SessionId('resume-load-factory-unload')
     const root = await persistSession(sessionId)
     const ctx = new Context()
@@ -958,8 +957,10 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     const resuming = ctx.agents.resume({ resumeSessionId: sessionId, agentOptions: { provider: 'mock', model: 'mock' } })
     await openStarted.promise
     const rejection = expect(promptly(resuming)).rejects.toThrow(/agent loop is not active/)
-    await promptly(loopFiber.dispose())
+    let disposed = false
+    const disposal = loopFiber.dispose().then(() => { disposed = true })
     await rejection
+    expect(disposed).toBe(false)
 
     expect(published).toEqual([])
     expect(ctx.agents.get(sessionId)).toBeUndefined()
@@ -967,7 +968,8 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     // The abandoned handle is closed once the hung open finally settles.
     const abandoned = abandonedHandleStub()
     lateOpen.resolve(abandoned.handle)
-    await expect.poll(() => abandoned.close.mock.calls.length).toBe(1)
+    await promptly(disposal)
+    expect(abandoned.close).toHaveBeenCalledTimes(1)
     expect(published).toEqual([])
     await ctx.fiber.dispose()
   })
@@ -1316,7 +1318,7 @@ describe('creation and resume cancellation edges', () => {
     expect(await run('string', 'late abort string')).toMatchObject({ message: expect.stringMatching(/creation aborted/) as unknown })
   })
 
-  it('an aborted create closes the write handle its abandoned backend create later resolves', async () => {
+  it('an aborted create reports a late close failure before releasing its owner', async () => {
     const sessionId = SessionId('create-abandoned-handle')
     const { ctx } = await persistentHarness(new MockAdapter([]))
     const lateCreate = Promise.withResolvers<SessionHandle>()
@@ -1333,13 +1335,13 @@ describe('creation and resume cancellation edges', () => {
     await expect(creating).rejects.toThrow('caller aborted create')
     expect(ctx.sessions.get(sessionId)).toBeUndefined()
 
-    // The abandoned backend create still resolves a real write handle later;
-    // the loop closes it so ownership is not leaked, and a rejecting close is
-    // swallowed — there is no owner left to observe it.
-    const close = vi.fn(async () => { throw new Error('abandoned close failed') })
+    const failure = new Error('abandoned close failed')
+    const report = vi.spyOn(ctx.logger, 'error')
+    const close = vi.fn(async () => { throw failure })
     lateCreate.resolve({ append: async () => {}, close } as unknown as SessionHandle)
     await expect.poll(() => close.mock.calls.length).toBe(1)
     await ctx.fiber.dispose()
+    expect(report).toHaveBeenCalledWith(failure)
   })
 
   it('closes the resume write handle when the loop becomes inactive before setup', async () => {
@@ -1419,6 +1421,7 @@ describe('configured-start failure edges', () => {
 
     await expect(promptly(resuming)).rejects.toThrow(/creation aborted/)
     expect(ctx.agents.get(sessionId)).toBeUndefined()
+    gate.reject(controller.signal.reason)
     await ctx.fiber.dispose()
   })
 

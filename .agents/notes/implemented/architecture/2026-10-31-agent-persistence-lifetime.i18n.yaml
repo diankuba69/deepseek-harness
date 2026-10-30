@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-10-31-agent-persistence-lifetime.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-10-31-agent-persistence-lifetime.md
+/agent-note-retain-the-acquired-persistence-backend-through-agent-teardown:
+  en: 6ef995f940164207
+  zh: ca327e5e10de017f
+/agent-note-retain-the-acquired-persistence-backend-through-agent-teardown/problem:
+  en: fdb2c0f30ca2ff4d
+  zh: 0e43ec1208d23eb7
+/agent-note-retain-the-acquired-persistence-backend-through-agent-teardown/decision:
+  en: b5f7522eba8e9152
+  zh: 6374e11a5f8d81a5
+/agent-note-retain-the-acquired-persistence-backend-through-agent-teardown/alternatives-considered:
+  en: 7cd7e71597f5720e
+  zh: 7a8abc37f21ac3bd
+/agent-note-retain-the-acquired-persistence-backend-through-agent-teardown/consequences:
+  en: 37322fb92a92301f
+  zh: 78107279a391e3c8

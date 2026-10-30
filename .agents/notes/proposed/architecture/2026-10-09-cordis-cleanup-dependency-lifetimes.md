@@ -8,23 +8,21 @@ English | [中文](2026-10-09-cordis-cleanup-dependency-lifetimes.zh.md)
 
 A disposer can await its consumers while another disposer has already removed the listener or closed the resource those consumers need. Awaiting a provider's final disposal promise therefore does not establish resource survival. This affects shutdown and plugin replacement, including final Session events, accepted reminder delivery, credential commits, and remote process termination.
 
-The [Cordis audit skill](../../../skills/cordis-styling-nitpicking/SKILL.md#p0-cleanup-dependency-released-before-consumer-completion) classifies this lifecycle violation as P0. [Fiber unload (`Fiber._unload`)](../../../../vendor/cordis/src/fiber.ts) starts sibling disposers concurrently; [service withdrawal (`ReflectService.provide`)](../../../../vendor/cordis/src/reflect.ts) waits for dependent fibers only inside its own disposer. Service injection establishes dependency tracking but cannot prevent sibling resource closure. [Event subscriptions (`EventsService.register`)](../../../../vendor/cordis/src/events.ts) are independently owned effects, including subscriptions made through a caller-traced service context.
+The [Cordis audit skill](../../../skills/cordis-styling-nitpicking/SKILL.md#p0-cleanup-dependency-released-before-consumer-completion) classifies this lifecycle violation as P0. Pinned [Fiber unload (`Fiber._unload`)](../../../../vendor/cordis/src/fiber.ts) retains declared implementation dependents through their complete cleanup, including concurrent root disposal, before disposing the provider fiber's effects. Resources owned by sibling or parent effects still need explicit composition with service withdrawal. [Event subscriptions (`EventsService.register`)](../../../../vendor/cordis/src/events.ts) are independently owned effects, including subscriptions made through a caller-traced service context.
 
 ## Proposal
 
 Make each required resource's owner retain it through the consumers' complete asynchronous cleanup. Stop admitting new work, settle accepted work and final publication, then drain and release the resource. Compose the actual disposers into an awaited ownership sequence; a returned wrapper does not capture an independently registered original effect. Preserve cancellation and error reporting while ensuring one failure cannot bypass remaining cleanup.
 
-The audit below records unresolved production paths inspected on 2026-10-09. It proposes implementation work; this note and the skill do not fix runtime behavior. Findings target the cleanup-dependency rule only, not the skill's separate singleton and unreversed-effect rules.
+The audit below records production paths inspected on 2026-10-09. The Session lifetime requirement is implemented; the other domains remain proposed work and are not re-audited by that fix. Findings target the cleanup-dependency rule only, not the skill's separate singleton and unreversed-effect rules.
 
 ## P0 findings
 
-### Session persistence drops events emitted during cleanup
+### Session persistence lifetime is implemented
 
-**Owners and evidence.** The [JSONL plugin (`apply`)](../../../../packages/session/session-persistence-jsonl/src/index.ts) composes service withdrawal before tracker disposal. The [tracker (`JsonlBackendTracker.install`)](../../../../packages/session/session-persistence-jsonl/src/storage.ts) removes live-event listeners before closing handles. This protects consumers unloaded by provider withdrawal, but concurrent root disposal can unregister consumer fibers before withdrawal discovers them; the plugin explicitly excludes that ordering guarantee. The Agent loop [cancels, awaits idle and scope disposal, then closes its handle (`AgentLoop.prepare`)](../../../../packages/core/agent-loop/src/index.ts). The `AgentLoop.prepare` teardown comment explicitly requires backend live-event listeners to remain mounted through driver shutdown to receive closing events. Its [turn unwind (`ReactLoopAgent.turn`)](../../../../packages/core/agent-loop/src/agent.ts) can publish recovered tool results and closing events after awaits.
+The [Agent persistence lifetime decision](../../implemented/architecture/2026-10-31-agent-persistence-lifetime.md) retains one injected backend from acquisition through rollback or final Agent teardown. Combined with JSONL's existing service/tracker composite effect, it preserves final event routing during root disposal and provider unload. Focused tests compare live and reopened histories, reclaim write ownership, and cover late acquisition and cleanup failures; both SDK snapshot paths retain the canceled child suffix.
 
-**Failure and correction.** During root disposal, pause the turn's cancellation unwind. JSONL can remove its routing listeners and finish closing the currently buffered prefix before the turn emits its final events. Those events reach the live Session but never enter the writer; a later idempotent handle close cannot recover them. Retain routing, writers, and write ownership until every producer settles, then perform the final drain. This is source-traced; a full Session reproduction remains required.
-
-The [handle-based persistence decision](../../implemented/architecture/2026-08-27-handle-based-session-persistence.md) explicitly permits losing the unemitted remainder during root disposal. This proposal intentionally tightens that policy for events emitted while graceful cleanup finishes. Crash repair remains necessary for abrupt termination, but cannot substitute for persisting actual final results during awaited shutdown. The [logical-session storage proposal](2026-09-06-logical-session-storage-rebuild.md) relocates enqueue ownership in stage 4; it must also establish this teardown ordering.
+The [handle-based persistence decision](../../implemented/architecture/2026-08-27-handle-based-session-persistence.md) retains its handle API and storage ownership; its former graceful-tail-loss allowance is superseded. The [logical-session storage proposal](2026-09-06-logical-session-storage-rebuild.md) must preserve this ordering if it relocates enqueue ownership. No Session-format change or global serialization of Cordis disposal is needed.
 
 ### Storage closes before Schedule commits accepted delivery
 
@@ -68,7 +66,7 @@ The active-note supersession audit retains the handle-based persistence decision
 
 ## Alternatives considered
 
-**Add injection or reverse disposer registration order.** Dependency withdrawal already waits for consumers, and reverse invocation still starts sibling async cleanup concurrently. Neither keeps resources usable across consumer awaits.
+**Add injection without checking resource ownership, or reverse disposer registration order.** Injection retains its actual service implementation until the consumer finishes. It solves the Session consumer lifetime because JSONL already composes resource release after service withdrawal; it does not repair resources independently closed by a sibling or parent effect. Reverse invocation alone still starts asynchronous sibling cleanup concurrently.
 
 **Serialize every Cordis disposer globally.** This would change unrelated lifetimes, risk dependency deadlocks, and obscure which operations require each resource. Explicit composition expresses the necessary order locally.
 
@@ -79,7 +77,7 @@ The active-note supersession audit retains the handle-based persistence decision
 ## Acceptance criteria
 
 - Each finding receives a controlled-promise regression that pauses the real consumer before its last dependency use, starts provider or enclosing-owner disposal, releases the pause, and awaits both operation and disposal. Verify required resources and listeners survive the pause and are released afterward.
-- Session teardown persists the exact emitted final suffix, including tool results and closing events; compare live and restored history rather than checking only that `close()` ran. Cover provider replacement and root disposal, including cleanup failure paths.
+- Preserve the implemented [Session lifetime guarantee](../../implemented/architecture/2026-10-31-agent-persistence-lifetime.md) while addressing the remaining resource owners.
 - Schedule provider unload during the flush-to-task-commit interval retains successful final task state; restarting does not redeliver that completed occurrence. Keep the separately documented abrupt-crash duplication policy.
 - Account consumer disposal during successful commit returns an outcome consistent with stored credentials. Credentials provider disposal drains an already-admitted queued commit and rejects new admission without cancelling that commit.
 - SSH provider unload with live processes and PTYs completes dependent termination and confirmation before request resources close. Verify remote quiescence through the real helper; test failure propagation without claiming cleanup success from top-level process exit alone.
@@ -90,4 +88,4 @@ The active-note supersession audit retains the handle-based persistence decision
 
 Incorrectly composed dependencies can deadlock shutdown or retain a resource indefinitely. Tests must release controlled pauses even after failures, and implementations must preserve existing bounded external-operation policies. Holding providers longer can increase shutdown latency; hiding cleanup failure or silently dropping required final writes is not an acceptable shortcut.
 
-The focused experiments isolate storage, Authorization, composed SSH-provider teardown, and sandbox resource-release timing. They do not exercise complete product compositions or native Windows access. Session, Schedule consequences, queued credentials, actual remote process exit, and native sandbox behavior still need the integration evidence above before a fix can be considered complete. Listener ownership follows the actual caller context, so moving cleanup to a provider object without transferring its effect ownership may leave the race intact.
+The focused experiments isolate storage, Authorization, composed SSH-provider teardown, and sandbox resource-release timing. They do not exercise complete product compositions or native Windows access. Schedule consequences, queued credentials, actual remote process exit, and native sandbox behavior still need the integration evidence above before a fix can be considered complete. Listener ownership follows the actual caller context, so moving cleanup to a provider object without transferring its effect ownership may leave the race intact.

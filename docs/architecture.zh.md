@@ -74,7 +74,7 @@ Electron 使用 Electron Node 模式启动私有 Desktop Host。Host 调用共�
 - **Agent 事件**（`agent/*`）携带活跃 `Agent`：inbox、步骤、状态、请求、验证、续跑。要观察或拦截进行中的工作时，使用它。
 - **能力事件**无需导入循环即可向某个 seam（`fs/*`、`tools/*`、`telemetry/*`）附加策略和适配器。
 
-AgentLoop 初始化 Agent，失败则回滚，并在启动已排队工作前等待串行 `agent/created`。卸载在 Agent teardown 期间保留所需资源；[agent-loop](../packages/core/agent-loop/README.zh.md#understand-the-implementation)定义顺序。
+AgentLoop 初始化 Agent，失败则回滚，并在启动已排队工作前等待串行 `agent/created`。每个持久化 Agent 从获取起到最终事件排空完成始终保留后端，包括根上下文关闭；[agent-loop](../packages/core/agent-loop/README.zh.md#understand-the-implementation)定义顺序。
 
 [事件映射](event-producer-consumer.zh.md)列出每个事件的生产方与消费方。
 

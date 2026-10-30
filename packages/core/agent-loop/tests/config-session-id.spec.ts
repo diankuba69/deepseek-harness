@@ -1,6 +1,6 @@
 import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -335,14 +335,25 @@ describe('config-driven session id', () => {
   })
 
   it.each(['resolve', 'reject'] as const)(
-    'abandons an exact-id open that later %ss when AgentLoop disposal starts',
+    'awaits rollback of an exact-id open that later %ss during AgentLoop disposal',
     async (outcome) => {
       const root = await mkdtemp(join(tmpdir(), 'dsh-cfg-exact-dispose-'))
       dirs.push(root)
       const ctx = await makeCoreContext()
       await ctx.plugin(JsonlSessionPersistence, { root })
       const opening = Promise.withResolvers<SessionHandle>()
-      vi.spyOn(ctx.sessionPersistence, 'open').mockReturnValue(opening.promise)
+      onTestFinished(async () => {
+        opening.reject(new Error('test cleanup'))
+        await ctx.fiber.dispose()
+        await ctx.fiber.await()
+      })
+      const entered = Promise.withResolvers<undefined>()
+      const aborted = Promise.withResolvers<undefined>()
+      vi.spyOn(ctx.sessionPersistence, 'open').mockImplementation((_id, _access, options) => {
+        options?.signal?.addEventListener('abort', () => { aborted.resolve(undefined) }, { once: true })
+        entered.resolve(undefined)
+        return opening.promise
+      })
       const closed = vi.fn(async () => {})
       const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
       const failures: unknown[] = []
@@ -351,15 +362,18 @@ describe('config-driven session id', () => {
       const loop = await ctx.plugin(AgentLoop, {
         agents: [{ id: 'main', sessionId: SessionId('config-exact-dispose'), model: 'mock' }],
       })
-      await loop.dispose()
+      await entered.promise
+      let disposed = false
+      const disposal = loop.dispose().then(() => { disposed = true })
+      await aborted.promise
+      expect(disposed).toBe(false)
       if (outcome === 'resolve') {
         opening.resolve({ close: closed } as unknown as SessionHandle)
       } else {
         opening.reject(new Error('startup cancelled by teardown'))
       }
-      await Promise.resolve()
-      // The abandoned handle is closed; the rejected open is silently released.
-      if (outcome === 'resolve') await expect.poll(() => closed).toHaveBeenCalledOnce()
+      await disposal
+      if (outcome === 'resolve') expect(closed).toHaveBeenCalledOnce()
       expect(ctx.agents.get(SessionId('config-exact-dispose'))).toBeUndefined()
       expect(failures).toEqual([])
       expect(warn).not.toHaveBeenCalled()

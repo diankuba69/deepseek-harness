@@ -42,6 +42,8 @@ SDK scenarios compare committed expected output under `scripts/snapshots/python-
 
 `scheduler-recovery/` records a failed tool turn and a subsequent completed turn. It preserves the original `UNKNOWN` turn error, the first tool's completed result, and `TOOL_OUTCOME_UNKNOWN` / `TOOL_NOT_STARTED` results for the remaining calls. `sdk-snapshot` and `all` include this case; `--scenario sdk-recovery` runs it alone.
 
+`root-shutdown/` records a completed parent SDK result and the final cancellation events of a plugin-owned child still active when the runtime closes. `--scenario sdk-root-shutdown` runs this case alone; `all` includes it.
+
 The `advanced` and `restart` comparisons match native delivery qualifiers against each input's own Session generation, including SDK events and notifications. Captured and other delivery generations retain their numeric values. Each side must use one generation across its Session roles, and fresh logs must identify the current writer. Comparison never rewrites committed recordings.
 
 Trusted pull requests and master pushes also run `--scenario sdk-live --installed-wheel` on each selected native target. That scenario performs two tool-using turns against `https://api.deepseek.com`: it checks the created file immediately, replaces its content with a host-only random challenge, and requires the second turn to copy the changed content into a fresh receipt without modifying the source. Both turns must complete with the exact sentinel answer and a model-requested tool call; external byte comparisons check the files. Missing repository secrets fail instead of self-skipping. Fork and Dependabot pull requests run the complete keyless installed-wheel path but receive no key.

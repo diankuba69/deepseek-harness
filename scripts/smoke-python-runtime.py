@@ -159,6 +159,8 @@ RECOVERY_SNAPSHOT_DIRECTORY = (
     Path(__file__).resolve().parent / "snapshots" / "python-sdk-single-exe" / "scheduler-recovery"
 )
 RECOVERY_SNAPSHOT_FILENAMES = ("result.json", "requests.json", "session.v4.jsonl")
+SHUTDOWN_SNAPSHOT_DIRECTORY = ADVANCED_SNAPSHOT_ROOT / "root-shutdown"
+SHUTDOWN_SNAPSHOT_FILENAMES = ("result.json", "session.v4.jsonl", "session.1.v4.jsonl")
 MCP_SERVER_SCRIPT = """\
 import json
 import os
@@ -852,7 +854,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        choices=("all", "sdk-default", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-mcp", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-profile-plugin", "sdk-plugin-manager", "sdk-office", "sdk-authoring", "sdk-live", "runner", "direct"),
+        choices=("all", "sdk-default", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-mcp", "sdk-snapshot", "sdk-recovery", "sdk-root-shutdown", "sdk-restart", "sdk-profile-plugin", "sdk-plugin-manager", "sdk-office", "sdk-authoring", "sdk-live", "runner", "direct"),
         default="all",
     )
     parser.add_argument("--exe", type=Path)
@@ -871,10 +873,10 @@ def main() -> None:
         parser.error("--scenario sdk-profile-plugin requires --installed-wheel")
     if args.installed_wheel:
         args.exe = assert_installed_wheel_environment()
-    if args.scenario in {"all", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-office", "sdk-authoring", "sdk-plugin-manager", "runner", "direct"} and args.exe is None:
-        parser.error("--exe is required for custom, minimal, dynamic-tools, fs-search, spawn-node, snapshot, recovery, restart, office, runner, and direct scenarios")
-    if args.update_snapshots and args.scenario not in {"all", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-snapshot", "sdk-recovery", "sdk-restart", "sdk-authoring"}:
-        parser.error("--update-snapshots requires --scenario sdk-minimal, sdk-minimal-in-history, sdk-dynamic-tools, sdk-snapshot, sdk-recovery, sdk-restart, sdk-authoring, or all")
+    if args.scenario in {"all", "sdk-custom", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-fs-search", "sdk-spawn-node", "sdk-snapshot", "sdk-recovery", "sdk-root-shutdown", "sdk-restart", "sdk-office", "sdk-authoring", "sdk-plugin-manager", "runner", "direct"} and args.exe is None:
+        parser.error("--exe is required for custom, minimal, dynamic-tools, fs-search, spawn-node, snapshot, recovery, root-shutdown, restart, office, runner, and direct scenarios")
+    if args.update_snapshots and args.scenario not in {"all", "sdk-minimal", "sdk-minimal-in-history", "sdk-dynamic-tools", "sdk-snapshot", "sdk-recovery", "sdk-root-shutdown", "sdk-restart", "sdk-authoring"}:
+        parser.error("--update-snapshots requires --scenario sdk-minimal, sdk-minimal-in-history, sdk-dynamic-tools, sdk-snapshot, sdk-recovery, sdk-root-shutdown, sdk-restart, sdk-authoring, or all")
     if args.exe is not None and not args.exe.is_file():
         parser.error(f"runtime executable does not exist: {args.exe}")
 
@@ -935,6 +937,9 @@ def main() -> None:
         if args.scenario in {"all", "sdk-snapshot", "sdk-recovery"}:
             assert args.exe is not None
             smoke_sdk_scheduler_recovery(model.url, args.exe.resolve(), args.update_snapshots)
+        if args.scenario in {"all", "sdk-root-shutdown"}:
+            assert args.exe is not None
+            smoke_sdk_root_shutdown(model.url, args.exe.resolve(), args.update_snapshots)
         if args.scenario in {"all", "sdk-restart"}:
             assert args.exe is not None
             smoke_sdk_restart_snapshot(model.url, args.exe.resolve(), args.update_snapshots)
@@ -2095,6 +2100,70 @@ def smoke_sdk_scheduler_recovery(base_url: str, executable: Path, update_snapsho
         compare_snapshot_files(
             files, update_snapshots, RECOVERY_SNAPSHOT_DIRECTORY, RECOVERY_SNAPSHOT_FILENAMES,
         )
+
+
+def smoke_sdk_root_shutdown(base_url: str, executable: Path, update_snapshots: bool) -> None:
+    """Memeriksa proyeksi SDK dan event akhir Agent saat root runtime ditutup."""
+    from deepseek_harness import DeepSeekHarness
+
+    session_id = "root-shutdown"
+    child_id = f"{session_id}-shutdown-child"
+    with tempfile.TemporaryDirectory(prefix="dsh-sdk-root-shutdown-") as temporary:
+        root = Path(temporary).resolve()
+        dsh_home = root / "home"
+        sessions = dsh_home / "sessions"
+        base_patch = write_advanced_profile_patch(root, "base.patch.yml", sessions)
+        patch = write_profile_patch(root, "shutdown.patch.yml", sessions, [
+            {"id": "session-title-llm", "disabled": True},
+            {"id": "session-log-deepseek", "config": {"enabled": False}},
+            {"insert": [{
+                "id": "shutdown-child-fixture",
+                "name": (Path(__file__).resolve().parent.parent
+                         / "snapshots/sdk/root-shutdown/shutdown-child.mjs").as_uri(),
+            }]},
+        ])
+        with DeepSeekHarness(
+            provider="deepseek-official", model="smoke-model", cwd=str(root),
+            dsh_bin=str(executable), dsh_home=str(dsh_home),
+            patches=(str(base_patch), str(patch)),
+            env={"DSH_PERMISSION_MODE": "danger-full-access", "DSH_TELEMETRY_DISABLED": "1"},
+            api_key="sk-keyless-smoke", base_url=base_url, request_timeout_seconds=60,
+        ) as harness:
+            result = harness.run(RESTART_FIRST_PROMPT, session_id=session_id)
+        if result.final_response != RESTART_FIRST_TEXT or result.finish_reason != "completed":
+            raise AssertionError(f"root shutdown changed the parent SDK result: {result}")
+        logs = read_session_logs(sessions)
+        if set(logs) != {session_id, child_id}:
+            raise AssertionError(f"root shutdown lost a persisted Agent: {sorted(logs)}")
+        child = logs[child_id]
+        if child[-1].get("type") != "turn/end" or child[-1]["data"]["reason"] != {
+            "kind": "aborted", "reason": {"kind": "disposed"},
+        }:
+            raise AssertionError(f"root shutdown lost the final turn outcome: {child[-1]}")
+        canceled = [record["data"] for record in child if record.get("type") == "agent/inbox/spliced"
+                    and record["data"].get("outcome") == "canceled"]
+        if [(item["target"], item["removedCount"]) for item in canceled] != [("next-step", 1), ("next-turn", 1)]:
+            raise AssertionError(f"root shutdown lost the canceled inbox: {canceled}")
+        replacements = [
+            *snapshot_directory_replacements(root, "{{cwd}}"),
+            (child_id, "{{child}}"), (session_id, "{{parent}}"),
+        ]
+        result_value = {
+            "session_id": result.session_id,
+            "final_response": result.final_response,
+            "finish_reason": result.finish_reason,
+            "eventTypes": [event.get("type") for event in result.events],
+            "notificationMethods": [notification.method for notification in result.notifications],
+            "childEventTypes": [record.get("type") for record in child[1:]],
+        }
+        files = {"result.json": json.dumps(normalize_snapshot_value(result_value, replacements), indent=2) + "\n"}
+        for index, identity in enumerate((session_id, child_id)):
+            normalized = project_session_snapshot([
+                normalize_snapshot_value(record, replacements) for record in logs[identity]
+            ])
+            content = render_jsonl(normalized)
+            files[snapshot_session_filename(index, session_header_version(content, "root shutdown"))] = content
+        compare_snapshot_files(files, update_snapshots, SHUTDOWN_SNAPSHOT_DIRECTORY, SHUTDOWN_SNAPSHOT_FILENAMES)
 
 
 def smoke_direct(base_url: str, executable: Path) -> None:

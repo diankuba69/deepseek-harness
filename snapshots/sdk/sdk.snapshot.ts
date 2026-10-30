@@ -203,6 +203,9 @@ const SDK_ASSERTIONS: Readonly<Record<string, SdkAssertions>> = {
   'dynamic-tool-updates': {
     expectedFinalResponse: 'DONE',
   },
+  'root-shutdown': {
+    patches: [fileURLToPath(new URL('./root-shutdown/runtime.cordis.yml', import.meta.url))],
+  },
   'tool-scheduler-recovery': {
     patches: [fileURLToPath(new URL('./tool-scheduler-recovery/runtime.cordis.yml', import.meta.url))],
   },
@@ -1520,6 +1523,18 @@ describe('TypeScript SDK snapshots over the jsonrpc runtime', () => {
           toolCallId: 'call_dynamic_ping', isError: false, content: [{ type: 'text', text: 'pong' }],
         } } })
       }
+      if (scenario.name === 'root-shutdown') {
+        expect(ordered).toHaveLength(2)
+        const child = records(ordered[1]!.content)
+        expect(child.at(-1)).toMatchObject({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'disposed' } } } })
+        expect(child.filter(event => event.type === 'agent/inbox/spliced'
+          && (event.data as JsonObject).outcome === 'canceled')).toMatchObject([
+          { data: { target: 'next-step', removedCount: 1 } },
+          { data: { target: 'next-turn', removedCount: 1 } },
+        ])
+        expect(child.some(event => event.type === 'user/message')).toBe(false)
+        expect(results[0]?.finishReason).toBe('completed')
+      }
       if (scenario.name === 'tool-scheduler-recovery') {
         expect(results).toHaveLength(2)
         const events = results.flatMap(result => result.events)
@@ -1720,7 +1735,7 @@ describe('TypeScript SDK snapshots over the jsonrpc runtime', () => {
       if (scenario.name === 'serial-created') {
         expect(observedMethods.has('subagent.started')).toBe(false)
       }
-      if (ordered.length > 1 && assertions.dshSdkChild === undefined) {
+      if (ordered.length > 1 && assertions.dshSdkChild === undefined && scenario.name !== 'root-shutdown') {
         expect(observedMethods.has('subagent.started')).toBe(true)
         expect(observedMethods.has('subagent.finished')).toBe(true)
       }
