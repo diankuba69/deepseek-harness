@@ -302,6 +302,64 @@ describe('workspace browser rows', () => {
     expect(onOpen).toHaveBeenCalledWith(result.id)
   })
 
+  it.each(['Enter', ' '])('opens a focused search result once with %j', (key) => {
+    const onOpen = vi.fn()
+    const result: SearchResultNode = {
+      id: sid('keyboard-result'), title: 'Keyboard result', workspace: 'Project',
+      running: false, runningSubagentCount: 0, completed: false, archived: false,
+    }
+    render(<SearchResultItem result={result} currentId={undefined} onOpen={onOpen}
+      onUnarchive={vi.fn()} useSessionAccess={allowAllAccess.useSessionAccess} t={t} />)
+    const row = screen.getByRole('treeitem')
+    expect(row.tabIndex).toBe(0)
+    row.focus()
+    expect(document.activeElement).toBe(row)
+    expect(fireEvent.keyDown(row, { key })).toBe(false)
+    expect(onOpen.mock.calls).toEqual([[result.id]])
+  })
+
+  it.each(['Enter', ' '])('leaves modified %j and unrelated keys on search results untouched', (key) => {
+    const onOpen = vi.fn()
+    const result: SearchResultNode = {
+      id: sid('shortcut-result'), title: 'Shortcut result', workspace: 'Project',
+      running: false, runningSubagentCount: 0, completed: false, archived: false,
+    }
+    render(<SearchResultItem result={result} currentId={undefined} onOpen={onOpen}
+      onUnarchive={vi.fn()} useSessionAccess={allowAllAccess.useSessionAccess} t={t} />)
+    const row = screen.getByRole('treeitem')
+    for (const modifiers of [{ altKey: true }, { ctrlKey: true }, { metaKey: true }, { shiftKey: true }]) {
+      expect(fireEvent.keyDown(row, { key, ...modifiers })).toBe(true)
+    }
+    for (const otherKey of ['ArrowDown', 'Escape', 'a']) {
+      expect(fireEvent.keyDown(row, { key: otherKey })).toBe(true)
+    }
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  it('keeps restore activation separate and retains the live result focus after restoring', () => {
+    const onOpen = vi.fn()
+    const onUnarchive = vi.fn()
+    const result: SearchResultNode = {
+      id: sid('restore-result'), title: 'Restore result', workspace: 'Project',
+      running: false, runningSubagentCount: 0, completed: false, archived: true,
+    }
+    const view = render(<SearchResultItem result={result} currentId={undefined} onOpen={onOpen}
+      onUnarchive={onUnarchive} useSessionAccess={allowAllAccess.useSessionAccess} t={t} />)
+    const row = screen.getByRole('treeitem')
+    const restore = screen.getByRole('button', { name: zh['menu.unarchiveSession'] })
+    restore.focus()
+    for (const key of ['Enter', ' ']) expect(fireEvent.keyDown(restore, { key })).toBe(true)
+    expect(onOpen).not.toHaveBeenCalled()
+    fireEvent.click(restore)
+    expect(onUnarchive.mock.calls).toEqual([[result.id]])
+    expect(onOpen).not.toHaveBeenCalled()
+    view.rerender(<SearchResultItem result={{ ...result, archived: false }} currentId={undefined} onOpen={onOpen}
+      onUnarchive={onUnarchive} useSessionAccess={allowAllAccess.useSessionAccess} t={t} />)
+    expect(screen.queryByRole('button', { name: zh['menu.unarchiveSession'] })).toBeNull()
+    expect(screen.getByRole('treeitem')).toBe(row)
+    expect(document.activeElement).toBe(row)
+  })
+
   it('withholds the search-result restore control while the Session access excludes unarchiving', () => {
     const result: SearchResultNode = {
       id: sid('archived-result'), title: 'Archived', workspace: 'Project',

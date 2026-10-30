@@ -1257,7 +1257,7 @@ describe('WorkspaceBrowser', () => {
       .toBe('已归档对话暂时无法查看，请取消归档后查看')
   })
 
-  it('does not open an archived search result or clear its query; it raises the not-openable notice instead', async () => {
+  it.each(['click', 'Enter', ' '])('keeps archived search and its query after %j and raises the not-openable notice', async (gesture) => {
     const open = vi.fn()
     const notifyArchivedNotOpenable = vi.fn()
     const b = mount({
@@ -1272,7 +1272,8 @@ describe('WorkspaceBrowser', () => {
     fireEvent.change(input, { target: { value: 'gone' } })
     await act(async () => { await Promise.resolve() })
     const row = within(screen.getByRole('tree', { name: '搜索结果' })).getByRole('treeitem')
-    fireEvent.click(row)
+    if (gesture === 'click') fireEvent.click(row)
+    else fireEvent.keyDown(row, { key: gesture })
     expect(open).not.toHaveBeenCalled()
     expect(notifyArchivedNotOpenable).toHaveBeenCalledOnce()
     expect(row.getAttribute('aria-description')).toBe('已归档对话暂时无法查看，请取消归档后查看')

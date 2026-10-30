@@ -134,6 +134,14 @@ describe('WorkspaceBrowser.module.css list', () => {
     expect(declarations('.sectionLabel')?.get('left')).toBe('-1px')
   })
 
+  it('reveals archived search actions during keyboard focus with the Session row display rule', () => {
+    const keyboard = ":global(html[data-input-modality='keyboard'])"
+    expect(rowDeclarations(`${keyboard} .searchResultRow:focus-within .rowActions`)?.get('display'))
+      .toBe(rowDeclarations(`${keyboard} .sessionRow:focus-within .rowActions`)?.get('display'))
+    expect(rowDeclarations(`${keyboard} .searchResultRow:focus-within .rowActions`)?.get('display'))
+      .toBe('inline-flex')
+  })
+
   it('extends native row action targets while retaining the compact layout footprint', () => {
     const button = rowDeclarations('.iconButton')
     expect(button?.get('width')).toBe('24px')

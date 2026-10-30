@@ -498,10 +498,10 @@ function SessionHoverContent({ node, cwd, now, renderSlot, t }: {
 }
 
 /**
- * One flat search result: title, Workspace context, and optional content
- * excerpt. Search navigation opens the session only; it does not address an
- * event inside the conversation. Archived rows carry a hover unarchive
- * button, because search is where the filter surfaces them for recovery.
+ * Hasil pencarian datar dengan judul, Workspace, dan cuplikan opsional.
+ * Tab memfokuskan baris; Enter atau Space tanpa modifier membuka Session melalui
+ * callback pemilik. Kontrol pemulihan menangani aktivasi sendiri dan mengembalikan
+ * fokus ke baris sebelum tombolnya hilang. Navigasi tidak memilih event percakapan.
  * @param props.result - merged local/content search row.
  * @param props.currentId - selected session id.
  * @param props.onOpen - open the selected session.
@@ -520,16 +520,25 @@ export function SearchResultItem({
   onUnarchive: (id: SearchResultNode['id']) => void
   t: RowTranslate
 } & Pick<WorkspaceBrowserProps, 'useSessionAccess'>) {
+  const rowRef = useRef<HTMLDivElement>(null)
   const selected = result.id === currentId
   const canUnarchive = useSessionAccess(result.id, 'workspace/unarchiveSession')
   const statuses = sessionStatuses(result, t)
   const primaryStatus = statuses[0]
   return (
     <div
+      ref={rowRef}
       className={clsx(css.searchResultRow, selected && css.selected, result.archived && css.archived)}
       role="treeitem"
       aria-selected={selected}
       aria-description={result.archived ? t('toast.archivedNotOpenable') : undefined}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+        if (event.key !== 'Enter' && event.key !== ' ') return
+        event.preventDefault()
+        onOpen(result.id)
+      }}
       onClick={() => { onOpen(result.id) }}
     >
       <span className={css.searchResultHeading}>
@@ -549,7 +558,11 @@ export function SearchResultItem({
                 type="button"
                 className={css.iconButton}
                 aria-label={t('menu.unarchiveSession')}
-                onClick={(e) => { e.stopPropagation(); onUnarchive(result.id) }}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  if (event.currentTarget === document.activeElement) rowRef.current?.focus()
+                  onUnarchive(result.id)
+                }}
               >
                 <IconUnarchiveOutlineRegular size={14} />
               </button>

@@ -46,7 +46,8 @@ it.each([false, true])('shows the new-session shortcut on keyboard focus with to
   }
 })
 
-it.each([false, true])('keeps workspace and archived search actions reachable with touch=%s', async (hasTouch) => {
+it.each(['pointer', 'Enter', 'Space', 'touch'] as const)('keeps workspace and archived search actions reachable with %s', async (mode) => {
+  const hasTouch = mode === 'touch'
   const scaffold = await launchWebScaffold()
   onTestFinished(() => scaffold.close())
   const fixture = createChatScrollFixture({ markerPrefix: 'ROW_ACTIONS', title: 'Archived row actions', turns: 1 })
@@ -132,16 +133,40 @@ it.each([false, true])('keeps workspace and archived search actions reachable wi
   await activate(page.getByRole('button', { name: 'View options', exact: true }))
   await activate(page.getByRole('menuitem', { name: 'All conversations (show archived)', exact: true }))
   await activate(page.getByRole('button', { name: 'Search sessions', exact: true }))
-  await page.getByRole('textbox', { name: 'Search session names', exact: true }).fill(fixture.markers.user(1))
+  const search = page.getByRole('textbox', { name: 'Search session names', exact: true })
+  await search.fill(fixture.markers.user(1))
   const result = page.getByRole('tree', { name: 'Search results' }).getByRole('treeitem')
   await result.waitFor()
   const restore = result.getByRole('button', { name: 'Unarchive session', exact: true, includeHidden: true })
+  await page.mouse.move(0, 0)
   expect(await restore.isVisible()).toBe(hasTouch)
-  if (!hasTouch) await result.hover()
-  await activate(restore)
+  const liveResult = await result.elementHandle()
+  if (mode === 'Enter' || mode === 'Space') {
+    await search.focus()
+    for (let tab = 0; tab < 8 && !await result.evaluate(element => element === document.activeElement); tab++) {
+      await page.keyboard.press('Tab')
+    }
+    expect(await result.evaluate(element => element === document.activeElement)).toBe(true)
+    expect(await result.evaluate(element => element.matches(':hover'))).toBe(false)
+    expect(await restore.isVisible()).toBe(true)
+    await page.keyboard.press('Tab')
+    expect(await restore.evaluate(element => element === document.activeElement)).toBe(true)
+    await page.keyboard.press(mode)
+  } else {
+    if (!hasTouch) await result.hover()
+    await activate(restore)
+  }
   await expect.poll(() => scaffold.ctx.workspaceRegistry.archivedSessionIds.includes(id)).toBe(false)
   await restore.waitFor({ state: 'detached' })
-  await activate(result)
+  expect(await search.inputValue()).toBe(fixture.markers.user(1))
+  expect(await liveResult!.evaluate(element => element.isConnected)).toBe(true)
+  expect(await result.getAttribute('aria-selected')).toBe('false')
+  if (mode === 'Enter' || mode === 'Space') {
+    expect(await result.evaluate(element => element === document.activeElement)).toBe(true)
+    await page.keyboard.press(mode)
+  } else {
+    await activate(result)
+  }
   await expect.poll(() => row.getAttribute('aria-selected')).toBe('true')
 })
 
