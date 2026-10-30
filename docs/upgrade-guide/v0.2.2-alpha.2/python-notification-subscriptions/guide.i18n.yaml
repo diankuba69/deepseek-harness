@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.2-alpha.2/python-notification-subscriptions/guide.md
+/:
+  en: 84d7463652a8f236
+  zh: 9288748fbadd871b
+/python-notification-subscriptions-terminate-persistently:
+  en: e392856e81829890
+  zh: 9a4d5704b4051391
+/python-notification-subscriptions-terminate-persistently/change:
+  en: e3065f234a308b7d
+  zh: af3e2c3ebe2c37aa
+/python-notification-subscriptions-terminate-persistently/migration:
+  en: 6746c692629aa808
+  zh: d78bcbb0171bb81d

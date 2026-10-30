@@ -6,7 +6,7 @@ class HarnessError(Exception):
 
 
 class TransportClosedError(HarnessError):
-    """Raised when the runtime subprocess exits or closes stdout."""
+    """Dilempar saat runtime berhenti, stdout ditutup, atau langganan ditutup."""
 
 
 class SdkProtocolError(HarnessError):

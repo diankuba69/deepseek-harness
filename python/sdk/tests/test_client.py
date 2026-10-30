@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from deepseek_harness import DeepSeekHarness, HarnessClient, HarnessConfig, Notification, RunResult, SdkProtocolError
-from deepseek_harness.errors import JsonRpcError
+from deepseek_harness.errors import JsonRpcError, TransportClosedError
 
 
 def test_high_level_sdk_runs_turn_and_preserves_auto_review_errors(tmp_path: Path) -> None:
@@ -605,6 +605,239 @@ def test_notification_timeout_keeps_subscription_available_for_later_events() ->
         assert subscription.next(timeout_seconds=0).payload == {"value": 1}
 
 
+@pytest.mark.parametrize("termination", ["subscription-close", "client-close", "transport-failure"])
+def test_notification_terminal_state_wakes_all_pending_readers(
+    termination: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HarnessClient()
+    subscription = client.subscribe_notifications()
+    parked = threading.Event()
+    original_wait = threading.Condition.wait
+    waiting_count = 0
+    outcomes: list[BaseException | Notification] = []
+
+    def observe_wait(condition: threading.Condition, timeout: float | None = None) -> bool:
+        nonlocal waiting_count
+        if threading.current_thread().name.startswith("sdk-subscription-test-"):
+            waiting_count += 1
+            if waiting_count == 2:
+                parked.set()
+        return original_wait(condition, timeout)
+
+    monkeypatch.setattr(threading.Condition, "wait", observe_wait)
+
+    def read() -> None:
+        try:
+            outcomes.append(subscription.next(timeout_seconds=1))
+        except BaseException as error:
+            outcomes.append(error)
+
+    readers = [
+        threading.Thread(target=read, name=f"sdk-subscription-test-{index}", daemon=True)
+        for index in range(2)
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        assert parked.wait(timeout=1)
+        if termination == "subscription-close":
+            subscription.close()
+        elif termination == "client-close":
+            client.close()
+        else:
+            client._fail_waiters(TransportClosedError("transport failed"))
+        for reader in readers:
+            reader.join(timeout=2)
+        assert len(outcomes) == 2
+        assert all(isinstance(outcome, TransportClosedError) for outcome in outcomes)
+        for _ in range(2):
+            with pytest.raises(TransportClosedError):
+                subscription.next(timeout_seconds=0)
+    finally:
+        subscription.close()
+        for reader in readers:
+            reader.join(timeout=2)
+
+
+def test_notification_close_discards_queued_items_and_keeps_terminal_state() -> None:
+    client = HarnessClient()
+    subscription = client.subscribe_notifications()
+    client._handle_message({"method": "tick", "params": {"value": 1}})
+    subscription.close()
+    subscription.close()
+    for _ in range(2):
+        with pytest.raises(TransportClosedError):
+            subscription.next(timeout_seconds=0)
+    with pytest.raises(TransportClosedError):
+        subscription.drain(lambda _notification: pytest.fail("closed subscription delivered a notification"))
+
+
+@pytest.mark.parametrize("consume", ["next", "drain"])
+def test_notification_failure_preserves_queued_items_before_sticky_error(consume: str) -> None:
+    client = HarnessClient()
+    subscription = client.subscribe_notifications()
+    for value in [1, 2]:
+        client._handle_message({"method": "tick", "params": {"value": value}})
+    failure = TransportClosedError("transport failed")
+    client._fail_waiters(failure)
+    client._fail_waiters(TransportClosedError("later transport failure"))
+    seen: list[Notification] = []
+    if consume == "next":
+        seen = [subscription.next(timeout_seconds=0), subscription.next(timeout_seconds=0)]
+    else:
+        with pytest.raises(TransportClosedError) as raised:
+            subscription.drain(seen.append)
+        assert raised.value is failure
+    assert [notification.payload for notification in seen] == [{"value": 1}, {"value": 2}]
+    for _ in range(2):
+        with pytest.raises(TransportClosedError) as raised:
+            subscription.next(timeout_seconds=0)
+        assert raised.value is failure
+    with pytest.raises(TransportClosedError) as raised:
+        client.subscribe_notifications().next(timeout_seconds=0)
+    assert raised.value is failure
+
+
+def test_notification_close_during_filter_discards_inflight_delivery() -> None:
+    client = HarnessClient()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def matches(_notification: Notification) -> bool:
+        entered.set()
+        assert release.wait(timeout=2)
+        return True
+
+    subscription = client.subscribe_notifications(matches)
+    producer = threading.Thread(target=client._handle_message, args=({"method": "tick"},), daemon=True)
+    producer.start()
+    try:
+        assert entered.wait(timeout=1)
+        subscription.close()
+    finally:
+        release.set()
+        producer.join(timeout=2)
+    assert not producer.is_alive()
+    with pytest.raises(TransportClosedError):
+        subscription.next(timeout_seconds=0)
+
+
+def test_notification_drain_callback_can_close_subscription() -> None:
+    client = HarnessClient()
+    subscription = client.subscribe_notifications()
+    client._handle_message({"method": "tick"})
+    finished = threading.Event()
+    outcomes: list[BaseException] = []
+
+    def drain() -> None:
+        try:
+            subscription.drain(lambda _notification: subscription.close())
+        except BaseException as error:
+            outcomes.append(error)
+        finally:
+            finished.set()
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    assert finished.wait(timeout=1)
+    reader.join(timeout=1)
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], TransportClosedError)
+
+
+def test_notification_subscriptions_remain_terminal_across_runtime_restart(tmp_path: Path) -> None:
+    script = tmp_path / "notification_runtime.py"
+    script.write_text(
+        """
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message["method"] == "end":
+        break
+    if message["method"] == "emit":
+        print(json.dumps({"method": "tick", "params": {"value": 1}}), flush=True)
+    if message["method"] == "shutdown":
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        break
+""".strip()
+    )
+    client = HarnessClient(HarnessConfig(shutdown_timeout_seconds=0.1), _launch_args=(sys.executable, str(script)))
+    client.start()
+    first = client.subscribe_notifications()
+    try:
+        client.notify("end")
+        assert client._reader_thread is not None
+        client._reader_thread.join(timeout=2)
+        assert not client._reader_thread.is_alive()
+        after_eof = client.subscribe_notifications()
+        for subscription in [first, after_eof]:
+            with pytest.raises(TransportClosedError):
+                subscription.next(timeout_seconds=0)
+        client.close()
+        client.start()
+        with client.subscribe_notifications() as restarted:
+            client.notify("emit")
+            assert restarted.next(timeout_seconds=2).payload == {"value": 1}
+        for subscription in [first, after_eof]:
+            with pytest.raises(TransportClosedError):
+                subscription.next(timeout_seconds=0)
+    finally:
+        client.close()
+
+
+def test_notification_subscription_ignores_old_reader_failure_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "notification_runtime.py"
+    script.write_text(
+        """
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message["method"] == "end":
+        break
+    if message["method"] == "emit":
+        print(json.dumps({"method": "tick"}), flush=True)
+    if message["method"] == "shutdown":
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        break
+""".strip()
+    )
+    client = HarnessClient(HarnessConfig(shutdown_timeout_seconds=0.1), _launch_args=(sys.executable, str(script)))
+    reached_eof = threading.Event()
+    release = threading.Event()
+    original_error = client._runtime_closed_error
+
+    def delay_old_eof(reason: str) -> TransportClosedError:
+        if reason.endswith("stdout closed") and not reached_eof.is_set():
+            reached_eof.set()
+            assert release.wait(timeout=3)
+        return original_error(reason)
+
+    monkeypatch.setattr(client, "_runtime_closed_error", delay_old_eof)
+    client.start()
+    old_reader = client._reader_thread
+    try:
+        client.notify("end")
+        assert reached_eof.wait(timeout=1)
+        client.close()
+        client.start()
+        with client.subscribe_notifications() as restarted:
+            release.set()
+            assert old_reader is not None
+            old_reader.join(timeout=1)
+            assert not old_reader.is_alive()
+            client.notify("emit")
+            assert restarted.next(timeout_seconds=1).method == "tick"
+    finally:
+        release.set()
+        client.close()
+
+
 def test_session_subscription_keeps_descendant_relationships_across_subscriptions() -> None:
     client = HarnessClient()
     with client.subscribe_session_notifications("main") as first:
@@ -732,8 +965,9 @@ for line in sys.stdin:
             client.subscribe_notifications(lambda notification: notification.method == "tick") as healthy,
         ):
             client.notify("emit-first")
-            with pytest.raises(RuntimeError, match="bad notification filter"):
-                broken.next()
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="bad notification filter"):
+                    broken.next(timeout_seconds=1)
             assert healthy.next().payload == {"source": "emit-first"}
             assert client._notifications.qsize() == 0
 

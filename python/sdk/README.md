@@ -143,6 +143,10 @@ For ordinary prompts, `Session.run()` owns an activity interval from its prompt'
 
 `NotificationSubscription.next(timeout_seconds=...)` bounds one local notification wait and raises `TimeoutError` on expiry. Omitting the argument waits indefinitely. A timeout neither cancels runtime work nor closes the subscription; a later call can receive subsequent notifications.
 
+`NotificationSubscription.close()` drops queued notifications and wakes all pending readers. Closing an active subscription sets `TransportClosedError`; an earlier terminal error remains unchanged. Runtime termination preserves already queued notifications for `next()` or `drain()`, then both methods keep raising the first terminal error. A failing filter terminates only its own subscription with that error. `drain()` invokes callbacks without holding the subscription lock.
+
+Subscriptions created after runtime termination fail immediately. After `HarnessClient.close()` and `start()`, create new subscriptions for the new runtime; old subscriptions remain terminal.
+
 `HarnessClient` retains discovered subagent ancestry for the runtime process lifetime. During `Session.run()`, `RunResult.notifications` and `on_notification` receive the root session and known descendants in wire order. `RunResult.events` contains root-session events only, so descendant output cannot replace the root response. The low-level `session_prompt()` returns the queued message id immediately; callers that bypass `Session.run()` own the later activity boundary.
 
 The selected home stores profiles, plugins, and every profile-owned durable resource. The full `sdk` profile uses its credentials, settings, and session stores; `sdk-minimal` uses JSONL session storage and stores images under `$DSH_HOME/attachments/v1`, with request-image cache under `$DSH_HOME/cache/attachments`. Use a fresh home when those resources must be isolated, and a fresh session id for independent work. Reusing both a harness and session id continues the durable conversation and session-owned resources.
