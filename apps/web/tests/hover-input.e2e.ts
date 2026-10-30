@@ -46,7 +46,10 @@ it.each([false, true])('shows the new-session shortcut on keyboard focus with to
   }
 })
 
-it.each(['pointer', 'Enter', 'Space', 'touch'] as const)('keeps workspace and archived search actions reachable with %s', async (mode) => {
+it.each([
+  ['pointer', 'show'], ['Enter', 'show'], ['Space', 'show'], ['touch', 'show'],
+  ['Enter', 'only'], ['Space', 'only'],
+] as const)('keeps workspace and archived search actions reachable with %s in %s', async (mode, filter) => {
   const hasTouch = mode === 'touch'
   const scaffold = await launchWebScaffold()
   onTestFinished(() => scaffold.close())
@@ -56,7 +59,7 @@ it.each(['pointer', 'Enter', 'Space', 'touch'] as const)('keeps workspace and ar
   onTestFinished(() => browser.close())
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, hasTouch, locale: 'en-US' })
   await page.addInitScript(() => { Object.defineProperty(navigator, 'platform', { value: 'MacIntel' }) })
-  onTestFailed(() => saveFailureShot(page, `row-actions-${String(hasTouch)}`))
+  onTestFailed(() => saveFailureShot(page, `row-actions-${mode}-${filter}`))
   const activate = async (target: Locator) => {
     if (hasTouch) await target.tap()
     else await target.click()
@@ -131,7 +134,8 @@ it.each(['pointer', 'Enter', 'Space', 'touch'] as const)('keeps workspace and ar
   await activate(archive)
   await row.waitFor({ state: 'detached' })
   await activate(page.getByRole('button', { name: 'View options', exact: true }))
-  await activate(page.getByRole('menuitem', { name: 'All conversations (show archived)', exact: true }))
+  const filterLabel = filter === 'only' ? 'Archived only' : 'All conversations (show archived)'
+  await activate(page.getByRole('menuitem', { name: filterLabel, exact: true }))
   await activate(page.getByRole('button', { name: 'Search sessions', exact: true }))
   const search = page.getByRole('textbox', { name: 'Search session names', exact: true })
   await search.fill(fixture.markers.user(1))
@@ -159,6 +163,14 @@ it.each(['pointer', 'Enter', 'Space', 'touch'] as const)('keeps workspace and ar
   await expect.poll(() => scaffold.ctx.workspaceRegistry.archivedSessionIds.includes(id)).toBe(false)
   await restore.waitFor({ state: 'detached' })
   expect(await search.inputValue()).toBe(fixture.markers.user(1))
+  if (filter === 'only') {
+    await result.waitFor({ state: 'detached' })
+    expect(await liveResult!.evaluate(element => element.isConnected)).toBe(false)
+    expect(await search.evaluate(element => element === document.activeElement)).toBe(true)
+    await page.keyboard.press('Escape')
+    await page.getByText('No archived sessions yet', { exact: true }).waitFor()
+    return
+  }
   expect(await liveResult!.evaluate(element => element.isConnected)).toBe(true)
   expect(await result.getAttribute('aria-selected')).toBe('false')
   if (mode === 'Enter' || mode === 'Space') {

@@ -14,7 +14,7 @@
  * are slot entries with their own behavior, so this component threads no
  * action callbacks and hosts no action surface.
  */
-import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import { type CSSProperties, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import clsx from 'clsx'
 import { WorkspaceDialogs } from './WorkspaceDialogs.tsx'
 import {
@@ -802,6 +802,7 @@ function SearchResults({
   useSessionStatus,
   open,
   onUnarchive,
+  onFocusedResultRemoval,
   workspaces,
   archivedSessionIds,
   archivedFilter,
@@ -818,6 +819,8 @@ function SearchResults({
   archivedFilter: ArchivedFilter
   /** Unarchive an archived result row in place. */
   onUnarchive: (id: SessionNode['id']) => void
+  /** Fokus pengganti saat hasil yang sedang fokus dilepas; callback tetap stabil selama pencarian terpasang. */
+  onFocusedResultRemoval: () => void
   query: string
   remote: RemoteSearchState
   resultLimit: number
@@ -857,6 +860,7 @@ function SearchResults({
               currentId={currentId}
               onOpen={open}
               onUnarchive={onUnarchive}
+              onFocusedRemoval={onFocusedResultRemoval}
               useSessionAccess={useSessionAccess}
               t={t}
             />
@@ -1106,6 +1110,10 @@ export function WorkspaceBrowser({
   })
   const searchRoot = useRef<HTMLDivElement | null>(null)
   const searchInput = useRef<HTMLInputElement | null>(null)
+  const focusAfterSearchResultRemoval = useCallback(() => {
+    const input = searchInput.current
+    if (input?.isConnected && input.tabIndex === 0) input.focus()
+  }, [])
   // Section-header ＋ opens the picker menu (same popover in wide and rail
   // states; the menu anchors on this button).
   const wsPickerOpen = shortcutState.addRequested
@@ -1361,6 +1369,7 @@ export function WorkspaceBrowser({
               useSessionStatus={useSessionStatus}
               open={openSearchResult}
               onUnarchive={onSessionUnarchive}
+              onFocusedResultRemoval={focusAfterSearchResultRemoval}
               workspaces={workspaces}
               archivedSessionIds={archivedSessionIds}
               archivedFilter={archivedFilter}

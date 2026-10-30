@@ -1280,6 +1280,118 @@ describe('WorkspaceBrowser', () => {
     expect((input as HTMLInputElement).value).toBe('gone')
   })
 
+  it.each([
+    ['only', false], ['only', true], ['show', false], ['show', true],
+  ] as const)('preserves search focus when restoring in %s with focus moved=%s', async (filter, movedFocus) => {
+    const operation = Promise.withResolvers<undefined>()
+    const open = vi.fn()
+    const unarchiveSession = vi.fn(() => operation.promise)
+    const workspaces = [workspace('alpha', ['gone'])]
+    const b = mount({
+      useSessions: hook(sessionState([summary('gone', 1)])),
+      useWorkspaces: hook(workspaceState(workspaces, [sid('gone')])),
+      unarchiveSession,
+      open,
+    })
+    act(() => { b.store.actions.setArchivedFilter(filter) })
+    fireEvent.click(screen.getByRole('button', { name: zh['search.sessions.aria'] }))
+    const input = screen.getByPlaceholderText(zh['search.placeholder'])
+    fireEvent.change(input, { target: { value: 'gone' } })
+    const tree = screen.getByRole('tree', { name: zh['search.results.aria'] })
+    const row = within(tree).getByRole('treeitem')
+    const restore = within(row).getByRole('button', { name: zh['menu.unarchiveSession'] })
+    restore.focus()
+    fireEvent.click(restore)
+    expect(unarchiveSession.mock.calls).toEqual([[sid('gone')]])
+    expect(document.activeElement).toBe(row)
+    const elsewhere = screen.getByRole('button', { name: zh['search.clear'] })
+    if (movedFocus) elsewhere.focus()
+
+    rerender(b, { useWorkspaces: hook(workspaceState(workspaces)) })
+    const expectedFocus = movedFocus ? elsewhere : filter === 'only' ? input : row
+    expect(document.activeElement).toBe(expectedFocus)
+    expect(row.isConnected).toBe(filter === 'show')
+    expect((input as HTMLInputElement).value).toBe('gone')
+    expect(b.store.getSnapshot().archivedFilter).toBe(filter)
+    expect(open).not.toHaveBeenCalled()
+    await act(async () => { operation.resolve(undefined); await operation.promise })
+    expect(document.activeElement).toBe(expectedFocus)
+  })
+
+  it.each([false, true])('leaves closed search unfocused when opening a result with parent focus=%s', (parentFocus) => {
+    render(<button>Outside search</button>)
+    const outside = screen.getByRole('button', { name: 'Outside search' })
+    const open = vi.fn(() => { if (parentFocus) outside.focus() })
+    mount({
+      useSessions: hook(sessionState([summary('alive', 1)])),
+      open,
+    })
+    fireEvent.click(screen.getByRole('button', { name: zh['search.sessions.aria'] }))
+    const input = screen.getByPlaceholderText(zh['search.placeholder'])
+    fireEvent.change(input, { target: { value: 'alive' } })
+    const row = within(screen.getByRole('tree', { name: zh['search.results.aria'] })).getByRole('treeitem')
+    row.focus()
+    fireEvent.keyDown(row, { key: 'Enter' })
+    expect(open.mock.calls).toEqual([[sid('alive')]])
+    expect(input.tabIndex).toBe(-1)
+    expect(document.activeElement).toBe(parentFocus ? outside : document.body)
+  })
+
+  it.each(['rail', 'unmount'] as const)('does not restore search focus after %s during pending unarchive', async (exit) => {
+    const operation = Promise.withResolvers<undefined>()
+    render(<button>Outside search</button>)
+    const outside = screen.getByRole('button', { name: 'Outside search' })
+    const b = mount({
+      useSessions: hook(sessionState([summary('gone', 1)])),
+      useWorkspaces: hook(workspaceState([workspace('alpha', ['gone'])], [sid('gone')])),
+      unarchiveSession: () => operation.promise,
+    })
+    act(() => { b.store.actions.setArchivedFilter('only') })
+    fireEvent.click(screen.getByRole('button', { name: zh['search.sessions.aria'] }))
+    fireEvent.change(screen.getByPlaceholderText(zh['search.placeholder']), { target: { value: 'gone' } })
+    const row = within(screen.getByRole('tree', { name: zh['search.results.aria'] })).getByRole('treeitem')
+    const restore = within(row).getByRole('button', { name: zh['menu.unarchiveSession'] })
+    restore.focus()
+    fireEvent.click(restore)
+    if (exit === 'rail') rerender(b, { wide: false })
+    else b.view.unmount()
+    expect(screen.queryByPlaceholderText(zh['search.placeholder'])).toBeNull()
+    outside.focus()
+    await act(async () => { operation.resolve(undefined); await operation.promise })
+    expect(document.activeElement).toBe(outside)
+  })
+
+  it('keeps the focused archived-only result and query after restore fails', async () => {
+    const operation = Promise.withResolvers<undefined>()
+    const open = vi.fn()
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const b = mount({
+        useSessions: hook(sessionState([summary('gone', 1)])),
+        useWorkspaces: hook(workspaceState([workspace('alpha', ['gone'])], [sid('gone')])),
+        unarchiveSession: () => operation.promise,
+        open,
+      })
+      act(() => { b.store.actions.setArchivedFilter('only') })
+      fireEvent.click(screen.getByRole('button', { name: zh['search.sessions.aria'] }))
+      const input = screen.getByPlaceholderText(zh['search.placeholder'])
+      fireEvent.change(input, { target: { value: 'gone' } })
+      const row = within(screen.getByRole('tree', { name: zh['search.results.aria'] })).getByRole('treeitem')
+      const restore = within(row).getByRole('button', { name: zh['menu.unarchiveSession'] })
+      restore.focus()
+      fireEvent.click(restore)
+      await act(async () => { operation.reject(new Error('restore rejected')); await Promise.resolve() })
+      expect(row.isConnected).toBe(true)
+      expect(restore.isConnected).toBe(true)
+      expect(document.activeElement).toBe(row)
+      expect((input as HTMLInputElement).value).toBe('gone')
+      expect(b.store.getSnapshot().archivedFilter).toBe('only')
+      expect(open).not.toHaveBeenCalled()
+    } finally {
+      warning.mockRestore()
+    }
+  })
+
   it('offers unarchive on archived search results only', async () => {
     const unarchiveSession = vi.fn(async () => {})
     mount({
