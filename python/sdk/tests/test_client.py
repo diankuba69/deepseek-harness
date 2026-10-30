@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import queue
 import sys
 import threading
 import time
@@ -11,6 +12,7 @@ import pytest
 
 from deepseek_harness import DeepSeekHarness, HarnessClient, HarnessConfig, Notification, RunResult, SdkProtocolError
 from deepseek_harness.errors import JsonRpcError, TransportClosedError
+from deepseek_harness.models import JsonObject, JsonValue
 
 
 def test_high_level_sdk_runs_turn_and_preserves_auto_review_errors(tmp_path: Path) -> None:
@@ -833,6 +835,95 @@ for line in sys.stdin:
             assert not old_reader.is_alive()
             client.notify("emit")
             assert restarted.next(timeout_seconds=1).method == "tick"
+    finally:
+        release.set()
+        client.close()
+
+
+@pytest.mark.parametrize("stale_frame", [
+    {"method": "stale", "params": {}},
+    {"method": "subagent.started", "params": {"parentSessionId": "old-parent", "childSessionId": "old-child"}},
+    {"id": "old-request", "method": "approval/request", "params": {}},
+    {"id": "old-question", "method": "user-question/ask", "params": {
+        "requestId": "old-question", "sessionId": "old-session",
+        "questions": [{"id": "old-question", "question": "Old question?"}],
+    }},
+    {"id": "same-response-id", "result": {"from": "old-runtime"}},
+], ids=["notification", "ancestry", "incoming-request", "user-question", "response"])
+def test_old_reader_dispatch_cannot_reach_restarted_runtime(
+    tmp_path: Path, stale_frame: JsonObject,
+) -> None:
+    script = tmp_path / "buffered_notification_runtime.py"
+    script.write_text(
+        """
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "burst":
+        frames = [{"method": "hold"}, message["params"]["stale"]]
+        sys.stdout.write("".join(json.dumps(frame) + "\\n" for frame in frames))
+        sys.stdout.flush()
+    if message.get("method") == "emit":
+        print(json.dumps({"method": "fresh"}), flush=True)
+    if message.get("method") == "shutdown":
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        break
+""".strip()
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    question_called = threading.Event()
+
+    def hold_first(_notification: Notification) -> bool:
+        entered.set()
+        assert release.wait(timeout=5)
+        return True
+
+    def reject_stale(notification: Notification) -> bool:
+        if notification.method != "fresh":
+            raise RuntimeError("stale notification failed new subscription")
+        return True
+
+    def answer_old_question(_request: object, _cancelled: threading.Event) -> JsonObject:
+        question_called.set()
+        return {"cancelled": True}
+
+    client = HarnessClient(
+        HarnessConfig(shutdown_timeout_seconds=0.1, on_user_question=answer_old_question),
+        _launch_args=(sys.executable, str(script)),
+    )
+    client.start()
+    old_reader = client._reader_thread
+    old_subscription = client.subscribe_notifications(hold_first)
+    try:
+        client.notify("burst", {"stale": stale_frame})
+        assert entered.wait(timeout=2)
+        client.close()
+        client.start()
+        with client.subscribe_notifications(reject_stale) as restarted:
+            for inbox in [client._notifications, client._requests]:
+                while not inbox.empty():
+                    inbox.get_nowait()
+            response: queue.Queue[JsonValue | BaseException] = queue.Queue()
+            with client._lock:
+                client._responses["same-response-id"] = response
+            release.set()
+            assert old_reader is not None
+            old_reader.join(timeout=2)
+            assert not old_reader.is_alive()
+            client.notify("emit")
+            assert restarted.next(timeout_seconds=2).method == "fresh"
+            assert client._requests.empty()
+            assert response.empty()
+            with client._lock:
+                assert client._session_parents == {}
+                assert client._question_tasks == {}
+                assert not question_called.is_set()
+            assert client._notifications.empty()
+            with pytest.raises(TransportClosedError):
+                old_subscription.next(timeout_seconds=0)
     finally:
         release.set()
         client.close()

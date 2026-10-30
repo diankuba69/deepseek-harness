@@ -419,15 +419,16 @@ class HarnessClient:
             raise self._runtime_closed_error("Failed to write to DeepSeek Harness runtime") from exc
 
     def _start_reader_thread(self) -> None:
-        self._reader_thread = threading.Thread(target=self._reader_loop, name="dsh-runtime-reader", daemon=True)
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, args=(self._proc,), name="dsh-runtime-reader", daemon=True,
+        )
         self._reader_thread.start()
 
     def _start_stderr_thread(self) -> None:
         self._stderr_thread = threading.Thread(target=self._stderr_loop, name="dsh-runtime-stderr", daemon=True)
         self._stderr_thread.start()
 
-    def _reader_loop(self) -> None:
-        proc = self._proc
+    def _reader_loop(self, proc: subprocess.Popen[str] | None) -> None:
         if proc is None or proc.stdout is None:
             return
         try:
@@ -438,7 +439,7 @@ class HarnessClient:
                     message = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                self._handle_message(message)
+                self._handle_message(message, process=proc)
         except BaseException as exc:
             self._fail_waiters(exc, process=proc)
         finally:
@@ -451,7 +452,7 @@ class HarnessClient:
         for line in proc.stderr:
             self._stderr_lines.append(line.rstrip())
 
-    def _handle_message(self, message: object) -> None:
+    def _handle_message(self, message: object, *, process: subprocess.Popen[str] | None = None) -> None:
         if not isinstance(message, dict):
             return
         msg_id = message.get("id")
@@ -459,13 +460,18 @@ class HarnessClient:
         if isinstance(msg_id, (str, int)) and isinstance(method, str):
             params = message.get("params")
             request = IncomingRequest(id=msg_id, method=method, payload=params if isinstance(params, dict) else {})
-            if method == "user-question/ask" and self._user_question_handler is not None:
-                self._start_user_question(request)
-            else:
-                self._requests.put(request)
+            with self._lock:
+                if process is not None and self._proc is not process:
+                    return
+                if method != "user-question/ask" or self._user_question_handler is None:
+                    self._requests.put(request)
+                    return
+            self._start_user_question(request, process=process)
             return
         if isinstance(msg_id, (str, int)):
             with self._lock:
+                if process is not None and self._proc is not process:
+                    return
                 waiter = self._responses.pop(str(msg_id), None)
             if waiter is None:
                 return
@@ -479,6 +485,8 @@ class HarnessClient:
             params = message.get("params")
             notification = Notification(method=method, payload=params if isinstance(params, dict) else {})
             with self._lock:
+                if process is not None and self._proc is not process:
+                    return
                 if method == "user-question.cancelled":
                     task = self._question_tasks.get(str(notification.payload.get("requestId")))
                     if task is not None:
@@ -499,7 +507,9 @@ class HarnessClient:
                 if matches:
                     delivered = subscriber._push(notification) or delivered
             if not delivered:
-                self._notifications.put(notification)
+                with self._lock:
+                    if process is None or self._proc is process:
+                        self._notifications.put(notification)
 
     def _fail_waiters(self, exc: BaseException, *, process: subprocess.Popen[str] | None = None) -> None:
         with self._lock:
@@ -521,16 +531,21 @@ class HarnessClient:
         self._notifications.put(exc)
         self._requests.put(exc)
 
-    def _start_user_question(self, incoming: IncomingRequest) -> None:
+    def _start_user_question(self, incoming: IncomingRequest, *, process: subprocess.Popen[str] | None = None) -> None:
         """Keep the reader free to receive cancellation, other responses, and shutdown."""
-        handler = self._user_question_handler
-        proc = self._proc
+        with self._lock:
+            if process is not None and self._proc is not process:
+                return
+            handler = self._user_question_handler
+            proc = self._proc
         try:
             request = UserQuestionRequest.model_validate(incoming.payload)
             if any(not isinstance(item.get("id"), str) or not isinstance(item.get("question"), str) for item in request.questions):
                 raise ValueError("questions require id and question strings")
         except ValueError:
-            self.respond_error(incoming.id, code=-32602, message="invalid user-question/ask parameters")
+            with self._lock:
+                if not self._closing and self._proc is proc:
+                    self.respond_error(incoming.id, code=-32602, message="invalid user-question/ask parameters")
             return
         cancelled = threading.Event()
 
@@ -558,7 +573,7 @@ class HarnessClient:
 
         thread = threading.Thread(target=answer, name="dsh-user-question", daemon=True)
         with self._lock:
-            if self._closing:
+            if self._closing or self._proc is not proc:
                 return
             if request.request_id in self._question_tasks:
                 self.respond_error(incoming.id, code=-32602, message="duplicate user-question requestId")
