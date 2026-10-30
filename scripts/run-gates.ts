@@ -357,7 +357,6 @@ export function gatesForMode(selected: Mode): Gate[] {
         snapshotGate(),
         expectedOutputGate(),
         pnpmScript('build', 'build'),
-        pnpmScript('build:web', 'build:web'),
         ...hygieneLeafGates({ artifactNeeds: ['build'] }),
         ...docSyncLeafGates({
           docTypecheckNeeds: ['build'],

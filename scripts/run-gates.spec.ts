@@ -264,6 +264,16 @@ describe('gate graph validation', () => {
     await expect(runGates(subject, subject.length, execute)).resolves.toHaveLength(subject.length)
   })
 
+  it('check-all builds Web only through the complete build', () => {
+    const subject = withPnpmEntrypoint(() => gatesForMode('check-all'))
+
+    expect(subject.filter(gate => gate.id === 'build')).toEqual([
+      expect.objectContaining({ id: 'build', displayCommand: 'pnpm run build' }),
+    ])
+    expect(subject.map(gate => gate.id)).not.toContain('build:web')
+    expect(subject.map(gate => gate.displayCommand)).not.toContain('pnpm run build:web')
+  })
+
   it('uses the internal CI benchmark runner without changing the public benchmark scripts', () => {
     const subject = withPnpmEntrypoint(() => gatesForMode('ci-bench'))
     const { scripts } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {

@@ -151,7 +151,7 @@ The pi-ai check regenerates expected metadata in memory. It rejects stale data w
 
 Apart from the scoped pairing and provider metadata checks, the hooks intentionally do not run tests, snapshots, documentation checks, builds, or hygiene. Contributors run the [checks relevant to the changed behavior](../AGENTS.md#run-relevant-checks-locally) once; CI owns exhaustive coverage, built-artifact smokes, and the Node 24.9, latest 24, and 26 compatibility matrix.
 
-Contributors can opt into the comprehensive local gate set with `pnpm run check:all`. The command is independent of the Git hooks and is not an agent instruction.
+Contributors can opt into the comprehensive local gate set with `pnpm run check:all`. The complete build includes the Web build after the Client bundle. The command is independent of the Git hooks and is not an agent instruction.
 
 Outside CI (`CI` other than `true`), default worker counts follow the [local worker budget](../scripts/parallelism.ts): 12 for gate schedulers, `build`, `typecheck`, Oxlint, and publint, and 48 for Vitest forks and local coverage. `doc-sync`, `test:docs`, `hygiene`, and `check:all` run at most 8 gates at once, in CI as well. `os.availableParallelism()` reports host CPUs rather than a container's CPU quota, so uncapped defaults oversubscribe shared hosts. CI keeps the runner's CPU count. `DSH_GATE_CONCURRENCY`, `DSH_OXLINT_THREADS`, `DSH_COVERAGE_MAX_WORKERS`, and Vitest `--maxWorkers` override the defaults.
 
