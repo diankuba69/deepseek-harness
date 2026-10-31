@@ -1400,6 +1400,57 @@ describe('remaining branches', () => {
 })
 
 describe('connected generation', () => {
+  it('inserts new rows around surviving rows while refreshing their metadata on reconnect', async ({ mock, remote }) => {
+    const removed = 'removed' as SessionId
+    const beforeFirst = 'before-first' as SessionId
+    const beforeSecond = 'before-second' as SessionId
+    const tail = 'tail' as SessionId
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    remote.session.list.mockResolvedValueOnce(ok({ items: [summary(S1), summary(removed), summary(S2)] }))
+    await manager.refreshList()
+    expect(manager.getListSnapshot().items.map(item => item.sessionId)).toEqual([S1, removed, S2])
+
+    remote.session.list.mockResolvedValueOnce(ok({ items: [
+      summary(S2, { updatedAt: 900, running: true, cwd: '/refreshed-second' }),
+      summary(beforeFirst),
+      summary(beforeSecond),
+      summary(S1, { updatedAt: 800, cwd: '/refreshed-first' }),
+      summary(tail),
+    ] }))
+    manager.handleConnected()
+    await manager.refreshList()
+
+    const snapshot = manager.getListSnapshot()
+    expect(snapshot).toMatchObject({ state: 'idle', phase: 'ready', error: null })
+    expect(snapshot.items.map(item => item.sessionId)).toEqual([beforeFirst, beforeSecond, S1, S2, tail])
+    expect(snapshot.items[2]).toMatchObject({
+      sessionId: S1, updatedAt: 800, cwd: '/refreshed-first',
+    })
+    expect(snapshot.items[3]).toMatchObject({
+      sessionId: S2, updatedAt: 900, running: true, cwd: '/refreshed-second',
+    })
+  })
+
+  it.for([
+    { scenario: 'empty list receives rows', initial: [], baseline: [S2, S1], expected: [S2, S1] },
+    { scenario: 'all rows disappear', initial: [S1, S2], baseline: [], expected: [] },
+    { scenario: 'empty list stays empty', initial: [], baseline: [], expected: [] },
+  ])('reconciles the reconnect baseline when $scenario', async ({ initial, baseline, expected }, { mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    remote.session.list.mockResolvedValueOnce(ok({ items: initial.map(sessionId => summary(sessionId)) }))
+    await manager.refreshList()
+    expect(manager.getListSnapshot().items.map(item => item.sessionId)).toEqual(initial)
+
+    remote.session.list.mockResolvedValueOnce(ok({ items: baseline.map(sessionId => summary(sessionId)) }))
+    manager.handleConnected()
+    await manager.refreshList()
+
+    expect(manager.getListSnapshot()).toMatchObject({ state: 'idle', phase: 'ready', error: null })
+    expect(manager.getListSnapshot().items.map(item => item.sessionId)).toEqual(expected)
+  })
+
   it('does not prune running observations from a superseded empty list response', async ({ mock, remote }) => {
     const manager = makeManager(mock, remote)
     onTestFinished(() => manager.dispose())

@@ -56,8 +56,9 @@ class HarnessClient:
         self._responses: dict[str, queue.Queue[JsonValue | BaseException]] = {}
         self._notifications: queue.Queue[Notification | BaseException] = queue.Queue()
         self._notification_subscribers: dict[
-            str, tuple[queue.Queue[Notification | BaseException], NotificationFilter | None]
+            str, tuple[NotificationSubscription, NotificationFilter | None]
         ] = {}
+        self._terminal_failure: BaseException | None = None
         self._session_parents: dict[str, str] = {}
         self._requests: queue.Queue[IncomingRequest | BaseException] = queue.Queue()
         self._stderr_lines: deque[str] = deque(maxlen=400)
@@ -81,6 +82,7 @@ class HarnessClient:
             self._session_parents.clear()
             self._question_tasks.clear()
             self._closing = False
+            self._terminal_failure = None
             self._user_question_handler = self.config.on_user_question
         env = os.environ.copy()
         if self.config.env:
@@ -109,6 +111,7 @@ class HarnessClient:
                 cancelled.set()
         proc = self._proc
         if proc is None:
+            self._fail_waiters(self._runtime_closed_error("DeepSeek Harness runtime closed"))
             return
         shutdown_completed = False
         try:
@@ -297,11 +300,15 @@ class HarnessClient:
         self,
         notification_filter: NotificationFilter | None = None,
     ) -> "NotificationSubscription":
+        """Buat langganan; kegagalan runtime yang sudah terjadi tetap terlihat."""
         subscription_id = str(uuid.uuid4())
-        notifications: queue.Queue[Notification | BaseException] = queue.Queue()
+        subscription = NotificationSubscription(self, subscription_id)
         with self._lock:
-            self._notification_subscribers[subscription_id] = (notifications, notification_filter)
-        return NotificationSubscription(self, subscription_id, notifications)
+            if self._terminal_failure is not None:
+                subscription._fail(self._terminal_failure)
+            else:
+                self._notification_subscribers[subscription_id] = (subscription, notification_filter)
+        return subscription
 
     def subscribe_session_notifications(self, session_id: str) -> "NotificationSubscription":
         """Subscribe to a session and descendants discovered from subagent lifecycle edges."""
@@ -412,15 +419,16 @@ class HarnessClient:
             raise self._runtime_closed_error("Failed to write to DeepSeek Harness runtime") from exc
 
     def _start_reader_thread(self) -> None:
-        self._reader_thread = threading.Thread(target=self._reader_loop, name="dsh-runtime-reader", daemon=True)
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, args=(self._proc,), name="dsh-runtime-reader", daemon=True,
+        )
         self._reader_thread.start()
 
     def _start_stderr_thread(self) -> None:
         self._stderr_thread = threading.Thread(target=self._stderr_loop, name="dsh-runtime-stderr", daemon=True)
         self._stderr_thread.start()
 
-    def _reader_loop(self) -> None:
-        proc = self._proc
+    def _reader_loop(self, proc: subprocess.Popen[str] | None) -> None:
         if proc is None or proc.stdout is None:
             return
         try:
@@ -431,11 +439,11 @@ class HarnessClient:
                     message = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                self._handle_message(message)
+                self._handle_message(message, process=proc)
         except BaseException as exc:
-            self._fail_waiters(exc)
+            self._fail_waiters(exc, process=proc)
         finally:
-            self._fail_waiters(self._runtime_closed_error("DeepSeek Harness runtime stdout closed"))
+            self._fail_waiters(self._runtime_closed_error("DeepSeek Harness runtime stdout closed"), process=proc)
 
     def _stderr_loop(self) -> None:
         proc = self._proc
@@ -444,7 +452,7 @@ class HarnessClient:
         for line in proc.stderr:
             self._stderr_lines.append(line.rstrip())
 
-    def _handle_message(self, message: object) -> None:
+    def _handle_message(self, message: object, *, process: subprocess.Popen[str] | None = None) -> None:
         if not isinstance(message, dict):
             return
         msg_id = message.get("id")
@@ -452,13 +460,18 @@ class HarnessClient:
         if isinstance(msg_id, (str, int)) and isinstance(method, str):
             params = message.get("params")
             request = IncomingRequest(id=msg_id, method=method, payload=params if isinstance(params, dict) else {})
-            if method == "user-question/ask" and self._user_question_handler is not None:
-                self._start_user_question(request)
-            else:
-                self._requests.put(request)
+            with self._lock:
+                if process is not None and self._proc is not process:
+                    return
+                if method != "user-question/ask" or self._user_question_handler is None:
+                    self._requests.put(request)
+                    return
+            self._start_user_question(request, process=process)
             return
         if isinstance(msg_id, (str, int)):
             with self._lock:
+                if process is not None and self._proc is not process:
+                    return
                 waiter = self._responses.pop(str(msg_id), None)
             if waiter is None:
                 return
@@ -472,6 +485,8 @@ class HarnessClient:
             params = message.get("params")
             notification = Notification(method=method, payload=params if isinstance(params, dict) else {})
             with self._lock:
+                if process is not None and self._proc is not process:
+                    return
                 if method == "user-question.cancelled":
                     task = self._question_tasks.get(str(notification.payload.get("requestId")))
                     if task is not None:
@@ -487,16 +502,22 @@ class HarnessClient:
                         current = self._notification_subscribers.get(subscription_id)
                         if current is not None and current[0] is subscriber:
                             self._notification_subscribers.pop(subscription_id, None)
-                    subscriber.put(exc)
+                    subscriber._fail(exc)
                     continue
                 if matches:
-                    subscriber.put(notification)
-                    delivered = True
+                    delivered = subscriber._push(notification) or delivered
             if not delivered:
-                self._notifications.put(notification)
+                with self._lock:
+                    if process is None or self._proc is process:
+                        self._notifications.put(notification)
 
-    def _fail_waiters(self, exc: BaseException) -> None:
+    def _fail_waiters(self, exc: BaseException, *, process: subprocess.Popen[str] | None = None) -> None:
         with self._lock:
+            if process is not None and self._proc is not process:
+                return
+            if self._terminal_failure is None:
+                self._terminal_failure = exc
+            exc = self._terminal_failure
             for cancelled, _thread in self._question_tasks.values():
                 cancelled.set()
             waiters = list(self._responses.values())
@@ -506,20 +527,25 @@ class HarnessClient:
         for waiter in waiters:
             waiter.put(exc)
         for subscriber, _predicate in subscribers:
-            subscriber.put(exc)
+            subscriber._fail(exc)
         self._notifications.put(exc)
         self._requests.put(exc)
 
-    def _start_user_question(self, incoming: IncomingRequest) -> None:
+    def _start_user_question(self, incoming: IncomingRequest, *, process: subprocess.Popen[str] | None = None) -> None:
         """Keep the reader free to receive cancellation, other responses, and shutdown."""
-        handler = self._user_question_handler
-        proc = self._proc
+        with self._lock:
+            if process is not None and self._proc is not process:
+                return
+            handler = self._user_question_handler
+            proc = self._proc
         try:
             request = UserQuestionRequest.model_validate(incoming.payload)
             if any(not isinstance(item.get("id"), str) or not isinstance(item.get("question"), str) for item in request.questions):
                 raise ValueError("questions require id and question strings")
         except ValueError:
-            self.respond_error(incoming.id, code=-32602, message="invalid user-question/ask parameters")
+            with self._lock:
+                if not self._closing and self._proc is proc:
+                    self.respond_error(incoming.id, code=-32602, message="invalid user-question/ask parameters")
             return
         cancelled = threading.Event()
 
@@ -547,7 +573,7 @@ class HarnessClient:
 
         thread = threading.Thread(target=answer, name="dsh-user-question", daemon=True)
         with self._lock:
-            if self._closing:
+            if self._closing or self._proc is not proc:
                 return
             if request.request_id in self._question_tasks:
                 self.respond_error(incoming.id, code=-32602, message="duplicate user-question requestId")
@@ -671,12 +697,12 @@ class NotificationSubscription:
         self,
         client: HarnessClient,
         subscription_id: str,
-        notifications: queue.Queue[Notification | BaseException],
     ) -> None:
         self._client = client
         self._subscription_id = subscription_id
-        self._notifications = notifications
-        self._closed = False
+        self._notifications: deque[Notification] = deque()
+        self._condition = threading.Condition()
+        self._failure: BaseException | None = None
 
     def __enter__(self) -> "NotificationSubscription":
         return self
@@ -685,30 +711,53 @@ class NotificationSubscription:
         self.close()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        """Hentikan pengiriman, buang antrean, dan bangunkan semua pembaca."""
+        with self._condition:
+            self._notifications.clear()
+            if self._failure is None:
+                self._failure = TransportClosedError("notification subscription closed")
+            self._condition.notify_all()
         self._client._unsubscribe_notifications(self._subscription_id)
 
     def next(self, timeout_seconds: float | None = None) -> Notification:
-        """Read one notification; an optional timeout stops only this local wait."""
-        try:
-            item = self._notifications.get(timeout=timeout_seconds)
-        except queue.Empty as exc:
-            raise TimeoutError("timed out waiting for an SDK notification") from exc
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        """Baca antrean sebelum error terminal; timeout hanya menghentikan penantian ini."""
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("'timeout' must be a non-negative number")
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        with self._condition:
+            while not self._notifications:
+                if self._failure is not None:
+                    raise self._failure
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("timed out waiting for an SDK notification")
+                self._condition.wait(timeout=remaining)
+            return self._notifications.popleft()
 
     def drain(self, on_notification: Callable[[Notification], None]) -> None:
+        """Kirim antrean tanpa memegang lock callback, lalu laporkan error terminal."""
         while True:
-            try:
-                item = self._notifications.get_nowait()
-            except queue.Empty:
-                return
-            if isinstance(item, BaseException):
-                raise item
+            with self._condition:
+                if not self._notifications:
+                    if self._failure is not None:
+                        raise self._failure
+                    return
+                item = self._notifications.popleft()
             on_notification(item)
+
+    def _push(self, notification: Notification) -> bool:
+        with self._condition:
+            if self._failure is not None:
+                return False
+            self._notifications.append(notification)
+            self._condition.notify()
+            return True
+
+    def _fail(self, error: BaseException) -> None:
+        with self._condition:
+            if self._failure is None:
+                self._failure = error
+            self._condition.notify_all()
 
 
 class _SessionPromptResponse(BaseModel):

@@ -1,0 +1,52 @@
+{
+  "session_id": "{{parent}}",
+  "final_response": "PROCESS_ONE_OK",
+  "finish_reason": "completed",
+  "eventTypes": [
+    "agent/inbox/spliced",
+    "turn/start",
+    "agent/inbox/spliced",
+    "step/start",
+    "system/message",
+    "user/message",
+    "user/message",
+    "request/header",
+    "request/context",
+    "session/title",
+    "assistant/message",
+    "step/end",
+    "turn/end"
+  ],
+  "notificationMethods": [
+    "session.event",
+    "session.status",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.event",
+    "session.status"
+  ],
+  "childEventTypes": [
+    "permission/preset",
+    "sandbox/mode",
+    "approval/policy",
+    "agent/inbox/spliced",
+    "turn/start",
+    "agent/inbox/spliced",
+    "step/start",
+    "agent/inbox/spliced",
+    "agent/inbox/spliced",
+    "agent/inbox/spliced",
+    "agent/inbox/spliced",
+    "step/end",
+    "turn/end"
+  ]
+}

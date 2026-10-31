@@ -338,6 +338,188 @@ describe('SQLite session search', () => {
     expect(open).toHaveBeenCalledOnce()
   })
 
+  it('reuses committed live observations until searchable or non-searchable events append', async () => {
+    const ctx = await liveContext()
+    const session = ctx.sessions.create(SessionId('memo-warm'), {
+      seed: [
+        ...messageEvents('needle one'),
+        { ...messageEvents('needle two')[0]!, seq: SessionSeq(1) },
+      ],
+    })
+    const snapshot = vi.spyOn(session, 'snapshotEvents')
+    try {
+      const request = { sessionId: session.id, query: 'needle', limit: 1 }
+      const first = await ctx.sessionQuery.searchEvents(request)
+      const firstCursor = first.nextCursor
+      if (firstCursor === undefined) throw new Error('Cursor halaman awal tidak tersedia')
+      await expect(ctx.sessionQuery.searchEvents(request)).resolves.toEqual(first)
+      await expect(ctx.sessionQuery.searchEvents({ ...request, cursor: firstCursor }))
+        .resolves.toMatchObject({ items: [{ seq: SessionSeq(0) }] })
+      expect(snapshot).toHaveBeenCalledTimes(1)
+
+      session.append('turn/start', { turn: 1 })
+      await expect(ctx.sessionQuery.searchEvents({ ...request, cursor: firstCursor }))
+        .rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+      const afterTurn = await ctx.sessionQuery.searchEvents(request)
+      const afterTurnCursor = afterTurn.nextCursor
+      if (afterTurnCursor === undefined) throw new Error('Cursor setelah append tidak tersedia')
+      expect(afterTurn.items).toEqual(first.items)
+      expect(snapshot).toHaveBeenCalledTimes(2)
+
+      session.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'fresh needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      await expect(ctx.sessionQuery.searchEvents({ sessionId: session.id, query: 'fresh' }))
+        .resolves.toMatchObject({ items: [{ snippet: 'fresh needle' }] })
+      await expect(ctx.sessionQuery.searchEvents({ ...request, cursor: afterTurnCursor }))
+        .rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+      expect(snapshot).toHaveBeenCalledTimes(3)
+    } finally {
+      snapshot.mockRestore()
+      await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+    }
+  })
+
+  it('observes a new instance with the same id, header, and cursor', async () => {
+    const ctx = await liveContext()
+    const options = { seed: messageEvents('original needle'), meta: { createdAt: 10 } }
+    const first = ctx.sessions.prepare(SessionId('memo-replacement'), options)
+    const detach = ctx.sessions.enter(first)
+    await ctx.sessionQuery.searchSessions({ query: 'original' })
+    detach()
+    const second = ctx.sessions.prepare(first.id, { ...options, seed: messageEvents('replacement needle') })
+    const detachSecond = ctx.sessions.enter(second)
+    expect(second.header).toEqual(first.header)
+    expect(second.seq).toBe(first.seq)
+    try {
+      await expect(ctx.sessionQuery.searchSessions({ query: 'original' })).resolves.toEqual({ items: [] })
+      await expect(ctx.sessionQuery.searchSessions({ query: 'replacement' }))
+        .resolves.toMatchObject({ items: [{ header: second.header }] })
+      detachSecond()
+      ctx.sessions.enter(first)
+      await expect(ctx.sessionQuery.searchSessions({ query: 'replacement' })).resolves.toEqual({ items: [] })
+      await expect(ctx.sessionQuery.searchSessions({ query: 'original' }))
+        .resolves.toMatchObject({ items: [{ header: first.header }] })
+    } finally { await (ctx.sessionQuery as SqliteSessionQueryEngine).close() }
+  })
+
+  it('rebuilds a removed TEMP overlay when the same live instance reenters', async () => {
+    const ctx = await liveContext()
+    const session = ctx.sessions.prepare(SessionId('memo-reentry'), { seed: messageEvents('needle') })
+    const detach = ctx.sessions.enter(session)
+    const snapshot = vi.spyOn(session, 'snapshotEvents')
+    try {
+      await ctx.sessionQuery.searchSessions({ query: 'needle' })
+      detach()
+      await expect(ctx.sessionQuery.searchSessions({ query: 'needle' })).resolves.toEqual({ items: [] })
+      ctx.sessions.enter(session)
+      await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
+        .resolves.toMatchObject({ items: [{ header: session.header }] })
+      await ctx.sessionQuery.searchSessions({ query: 'needle' })
+      expect(snapshot).toHaveBeenCalledTimes(2)
+    } finally {
+      snapshot.mockRestore()
+      await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+    }
+  })
+
+  it('rechecks persisted presence, binding identity, and header compatibility for warm live observations', async () => {
+    TestPersistence.reset()
+    const ctx = await liveContext()
+    const session = ctx.sessions.create(SessionId('memo-provider'), { seed: messageEvents('needle'), meta: { createdAt: 10 } })
+    const snapshot = vi.spyOn(session, 'snapshotEvents')
+    let persistence = await ctx.plugin(TestPersistence)
+    try {
+      await ctx.sessionQuery.searchSessions({ query: 'needle' })
+      await ctx.sessionQuery.searchSessions({ query: 'needle' })
+      expect(snapshot).toHaveBeenCalledTimes(1)
+      TestPersistence.set({ meta: session.header, events: messageEvents('durable needle') })
+      await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
+        .resolves.toMatchObject({ items: [{ live: true, persisted: true }] })
+      expect(snapshot).toHaveBeenCalledTimes(2)
+      const revision = TestPersistence.revisions.get(session.id)!
+      await persistence.dispose()
+      persistence = await ctx.plugin(TestPersistence)
+      TestPersistence.revisions.set(session.id, revision)
+      await ctx.sessionQuery.searchSessions({ query: 'needle' })
+      await ctx.sessionQuery.searchSessions({ query: 'needle' })
+      expect(snapshot).toHaveBeenCalledTimes(3)
+      TestPersistence.set({ meta: { ...session.header, createdAt: 99 }, events: messageEvents('conflict') })
+      await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
+        .rejects.toThrow(expectCode('SESSION_QUERY_SOURCE_CONFLICT'))
+      expect(snapshot).toHaveBeenCalledTimes(3)
+      await persistence.dispose()
+      await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
+        .resolves.toMatchObject({ items: [{ live: true, persisted: false }] })
+      expect(snapshot).toHaveBeenCalledTimes(4)
+    } finally {
+      snapshot.mockRestore()
+      await persistence.dispose()
+      await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+    }
+  })
+
+  it('reobserves after COMMIT failure and retains only the successfully indexed cursor', async () => {
+    const ctx = await liveContext()
+    const session = ctx.sessions.create(SessionId('memo-rollback'), { seed: messageEvents('base') })
+    const snapshot = vi.spyOn(session, 'snapshotEvents')
+    const db = Reflect.get(ctx.sessionQuery, '_db') as DatabaseSync
+    const exec = db.exec.bind(db)
+    let failCommit = false
+    const statement = vi.spyOn(db, 'exec').mockImplementation((sql) => {
+      if (sql === 'COMMIT' && failCommit) {
+        failCommit = false
+        throw new Error('injected COMMIT failure')
+      }
+      exec(sql)
+    })
+    try {
+      await ctx.sessionQuery.searchSessions({ query: 'base' })
+      const committed = Reflect.get(ctx.sessionQuery, '_committedLive') as WeakMap<typeof session, object>
+      const beforeFailure = committed.get(session)
+      session.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'fresh needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      failCommit = true
+      await expect(ctx.sessionQuery.searchSessions({ query: 'fresh' }))
+        .rejects.toThrow(expectCode('SESSION_QUERY_INDEX_FAILED'))
+      expect(committed.get(session)).toBe(beforeFailure)
+      await expect(ctx.sessionQuery.searchSessions({ query: 'fresh' }))
+        .resolves.toMatchObject({ items: [{ bestMatch: { snippet: 'fresh needle' } }] })
+      await ctx.sessionQuery.searchSessions({ query: 'fresh' })
+      expect(snapshot).toHaveBeenCalledTimes(3)
+    } finally {
+      statement.mockRestore()
+      snapshot.mockRestore()
+      await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+    }
+  })
+
+  it('does not stamp a post-observation append with the earlier committed fingerprint', async () => {
+    const ctx = await liveContext()
+    const session = ctx.sessions.create(SessionId('memo-race'), { seed: messageEvents('base') })
+    const db = Reflect.get(ctx.sessionQuery, '_db') as DatabaseSync
+    const exec = db.exec.bind(db)
+    let appendAtCommit = true
+    const statement = vi.spyOn(db, 'exec').mockImplementation((sql) => {
+      if (sql === 'COMMIT' && appendAtCommit) {
+        appendAtCommit = false
+        session.append('user/message', createUserMessage({
+          content: [{ type: 'text', text: 'late needle' }], source: { kind: 'user' },
+        }), { surfaceOp: 'append' })
+      }
+      exec(sql)
+    })
+    try {
+      await expect(ctx.sessionQuery.searchSessions({ query: 'late' })).resolves.toEqual({ items: [] })
+      await expect(ctx.sessionQuery.searchSessions({ query: 'late' }))
+        .resolves.toMatchObject({ items: [{ bestMatch: { snippet: 'late needle' } }] })
+    } finally {
+      statement.mockRestore()
+      await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+    }
+  })
+
   it('searches two-character Unicode61 tokens in live-only sessions', async () => {
     const ctx = await liveContext({ path: ':memory:', snippetChars: 20 })
     const session = ctx.sessions.create(SessionId('live'), {

@@ -1,0 +1,10 @@
+version: 1
+scenario: persistent-pwsh-fallback-tail
+profile: headless
+composition: persistent-pwsh-fallback-tail
+recording: authored
+header:
+  class: persistent-pwsh-fallback-tail
+  pin: true
+  systemPromptSource: persistent-pwsh-tool-turn
+  toolSchemasSource: persistent-pwsh-tool-turn

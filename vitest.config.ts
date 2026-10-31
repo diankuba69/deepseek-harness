@@ -290,7 +290,6 @@ export default defineConfig({
         // assistant-stream reconciler, Controller entry, transport, Agent scope,
         // and adapters stay gated.
         'packages/api/session-controller/src/client/sessions/!(assistant-stream).ts',
-        'packages/api/session-controller/src/client/ordered-baseline.ts',
         'packages/api/session-controller/src/client/time-zone.ts',
         // Keep the browser conversation tree under its existing GUI debt
         // exemption while gating the newly stateful Host half and vocabulary.

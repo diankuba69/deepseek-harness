@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.2-alpha.2/fs-write-double-fault-errors/guide.md
+/:
+  en: 3b241862978ce426
+  zh: 30dca628012a8140
+/atomic-write-double-failures-use-fs-io-error:
+  en: 3e09cdb48cd0323f
+  zh: 824ab34104e1f50d
+/atomic-write-double-failures-use-fs-io-error/change:
+  en: aa7099a77cdde18c
+  zh: 658c3a74f00182b8
+/atomic-write-double-failures-use-fs-io-error/migration:
+  en: 0d019235a351c2e6
+  zh: f1a5a925999d2aa3

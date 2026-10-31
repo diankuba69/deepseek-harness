@@ -232,7 +232,12 @@ describe('web e2e: navigation & panes over a rich seeded session', () => {
       .split(SEED_ID).join('{{seededId}}')
     await compareOrRefreshGolden(SEARCH_EXPECTED, snapshot, MODE)
 
-    await result.click()
+    await search.focus()
+    for (let tab = 0; tab < 8 && !await result.evaluate(element => element === document.activeElement); tab++) {
+      await page.keyboard.press('Tab')
+    }
+    expect(await result.evaluate(element => element === document.activeElement)).toBe(true)
+    await page.keyboard.press('Enter')
     // Search navigation returns to the browser with the opened Session row exposed.
     await expect.poll(() => search.inputValue(), { timeout: 5_000 }).toBe('')
     const selectedRow = page.locator('[role="tree"][aria-label="Sessions"] [role="treeitem"][aria-selected="true"]')

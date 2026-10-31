@@ -1,0 +1,3 @@
+- insert:
+    - id: shutdown-child-fixture
+      name: './shutdown-child.mjs'

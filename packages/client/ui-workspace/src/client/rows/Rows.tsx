@@ -10,7 +10,7 @@
  * context; this package's own actions are entries like any plugin's. The
  * session and workspace hover cards are suppressed while a menu is open.
  */
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import type { PointerEvent, RefObject } from 'react'
 import clsx from 'clsx'
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
@@ -498,38 +498,54 @@ function SessionHoverContent({ node, cwd, now, renderSlot, t }: {
 }
 
 /**
- * One flat search result: title, Workspace context, and optional content
- * excerpt. Search navigation opens the session only; it does not address an
- * event inside the conversation. Archived rows carry a hover unarchive
- * button, because search is where the filter surfaces them for recovery.
+ * Hasil pencarian datar dengan judul, Workspace, dan cuplikan opsional.
+ * Tab memfokuskan baris; Enter atau Space tanpa modifier membuka Session melalui
+ * callback pemilik. Kontrol pemulihan menangani aktivasi sendiri dan mengembalikan
+ * fokus ke baris sebelum tombolnya hilang. Jika baris yang fokus dilepas,
+ * pemilik menerima permintaan fokus pengganti. Navigasi tidak memilih event percakapan.
  * @param props.result - merged local/content search row.
  * @param props.currentId - selected session id.
  * @param props.onOpen - open the selected session.
  * @param props.onUnarchive - unarchive an archived result row.
+ * @param props.onFocusedRemoval - fokus pengganti ketika baris yang sedang fokus dilepas; identitas callback harus stabil.
  * @param props.useSessionAccess - the browser root's Session access Hook; the restore control
  * appears only while the snapshot allows `workspace/unarchiveSession` for that Session.
  * @param props.t - Workspace-browser translation seat.
  * @returns the result row.
  */
 export function SearchResultItem({
-  result, currentId, onOpen, onUnarchive, useSessionAccess, t,
+  result, currentId, onOpen, onUnarchive, onFocusedRemoval, useSessionAccess, t,
 }: {
   result: SearchResultNode
   currentId: string | undefined
   onOpen: (id: SearchResultNode['id']) => void
   onUnarchive: (id: SearchResultNode['id']) => void
+  onFocusedRemoval?: () => void
   t: RowTranslate
 } & Pick<WorkspaceBrowserProps, 'useSessionAccess'>) {
+  const rowRef = useRef<HTMLDivElement | null>(null)
+  const setRowRef = useCallback((element: HTMLDivElement | null) => {
+    if (element === null && rowRef.current === document.activeElement) onFocusedRemoval?.()
+    rowRef.current = element
+  }, [onFocusedRemoval])
   const selected = result.id === currentId
   const canUnarchive = useSessionAccess(result.id, 'workspace/unarchiveSession')
   const statuses = sessionStatuses(result, t)
   const primaryStatus = statuses[0]
   return (
     <div
+      ref={setRowRef}
       className={clsx(css.searchResultRow, selected && css.selected, result.archived && css.archived)}
       role="treeitem"
       aria-selected={selected}
       aria-description={result.archived ? t('toast.archivedNotOpenable') : undefined}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+        if (event.key !== 'Enter' && event.key !== ' ') return
+        event.preventDefault()
+        onOpen(result.id)
+      }}
       onClick={() => { onOpen(result.id) }}
     >
       <span className={css.searchResultHeading}>
@@ -549,7 +565,11 @@ export function SearchResultItem({
                 type="button"
                 className={css.iconButton}
                 aria-label={t('menu.unarchiveSession')}
-                onClick={(e) => { e.stopPropagation(); onUnarchive(result.id) }}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  if (event.currentTarget === document.activeElement) rowRef.current?.focus()
+                  onUnarchive(result.id)
+                }}
               >
                 <IconUnarchiveOutlineRegular size={14} />
               </button>

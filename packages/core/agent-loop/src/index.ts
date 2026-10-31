@@ -124,30 +124,6 @@ async function raceAbort<T>(operation: PromiseLike<T> | T, signal: AbortSignal, 
   }
 }
 
-/** Start an abortable operation and release a value that arrives after cancellation. */
-async function raceAbortCall<T>(
-  operation: () => PromiseLike<T> | T,
-  signal: AbortSignal,
-  id: SessionId,
-  releaseAbandoned?: (value: T) => void,
-): Promise<T> {
-  if (signal.aborted) {
-    throw signal.reason instanceof Error
-      ? signal.reason
-      : new Error(`agent "${id}" creation aborted`, { cause: signal.reason })
-  }
-  const pending = Promise.resolve().then(operation)
-  try {
-    return await raceAbort(pending, signal, id)
-  } catch (error: unknown) {
-    // oxlint-disable-next-line typescript/no-unnecessary-condition -- the signal can abort while the operation is awaited.
-    if (signal.aborted && releaseAbandoned !== undefined) {
-      void pending.then(releaseAbandoned, () => undefined)
-    }
-    throw error
-  }
-}
-
 /** Reject an output-token cap that cannot be represented exactly on the request wire. */
 function assertAgentOptions(options: AgentOptions): void {
   if (options.maxTokens !== undefined
@@ -348,7 +324,7 @@ export class AgentLoop extends Service implements AgentFactory {
           })
           this.ownership.trackStartup(startup)
         } else {
-          const startup = this.restoreOrCreateConfigured(ctx, persistence, configuredId, options, meta).catch((error: unknown) => {
+          const startup = this.restoreOrCreateConfigured(ctx, configuredId, options, meta).catch((error: unknown) => {
             this.reportConfiguredStartupFailure(id, 'restore', configuredId, error)
           })
           this.ownership.trackStartup(startup)
@@ -356,8 +332,8 @@ export class AgentLoop extends Service implements AgentFactory {
         continue
       }
       ctx.effect(() => {
-        const fiber = ctx.inject(['sessionPersistence'], (childCtx: Context) => {
-          void this.resumeWith(ctx, childCtx.sessionPersistence, {
+        const fiber = ctx.inject(['sessionPersistence'], (_childCtx: Context) => {
+          void this.resume(ctx, {
             resumeSessionId,
             agentOptions: options,
             setup: (_agentCtx, agent) => { this.applyConfiguredRoute(agent, options) },
@@ -408,7 +384,6 @@ export class AgentLoop extends Service implements AgentFactory {
   /** Restore a materialized exact config identity on remount, or create it on first use. */
   private async restoreOrCreateConfigured(
     ownerCtx: Context,
-    persistence: SessionPersistence,
     sessionId: SessionId,
     agentOptions: AgentOptions,
     meta: Pick<SessionHeader, 'cwd'>,
@@ -416,7 +391,7 @@ export class AgentLoop extends Service implements AgentFactory {
     await this.waitForDrainingConfiguredIdentity(ownerCtx, sessionId)
     if (!this.ownership.isActive()) return
     try {
-      await this.resumeWith(ownerCtx, persistence, {
+      await this.resume(ownerCtx, {
         resumeSessionId: sessionId,
         agentOptions,
         setup: (_agentCtx, agent) => { this.applyConfiguredRoute(agent, agentOptions) },
@@ -598,8 +573,9 @@ export class AgentLoop extends Service implements AgentFactory {
       untrack()
       callerSignal?.removeEventListener('abort', onCallerAbort)
       this.ownership.signal.removeEventListener('abort', onFactoryTeardown)
-      await stored?.handle.close().catch((_closeError: unknown) => {
-        // Initialization failure remains primary when releasing the acquired handle fails.
+      await stored?.handle.close().catch((closeError: unknown) => {
+        // Error inisialisasi tetap utama; kegagalan pelepasan handle tetap terlihat.
+        loopCtx.logger.error(closeError)
       })
       throw error
     }
@@ -618,7 +594,7 @@ export class AgentLoop extends Service implements AgentFactory {
       const agent = machine
       assertLive()
 
-      return await agent.runMaintenance(async () => {
+      const handle = await agent.runMaintenance(async () => {
         publication = Promise.withResolvers<void>()
         try {
           assertLive()
@@ -647,9 +623,12 @@ export class AgentLoop extends Service implements AgentFactory {
           publication = undefined
         }
       })
+      callerSignal?.removeEventListener('abort', onCallerAbort)
+      return handle
     } catch (error: unknown) {
-      await dispose().catch((_disposeError: unknown) => {
-        // Initialization failure remains primary after cleanup reaches quiescence.
+      await dispose().catch((disposeError: unknown) => {
+        // Error inisialisasi tetap utama setelah cleanup selesai; kegagalan drain tetap dilaporkan.
+        loopCtx.logger.error(disposeError)
       })
       throw error
     }
@@ -666,33 +645,88 @@ export class AgentLoop extends Service implements AgentFactory {
    * @returns the published running agent.
    */
   async create(id: SessionId, options: AgentOptions = {}, meta: Pick<SessionHeader, 'cwd'> = {}): Promise<Agent> {
-    using preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(id, { meta }))
-    const stored = await this.createStoredSession(preparation.session)
-    return (await this.initializeAgent(this.ctx, {
-      session: preparation.session,
-      stored,
-      agentOptions: options,
-      source: 'startup',
-    })).agent
+    return (await this.createAgent(this.ctx, { sessionId: id, agentOptions: options, meta })).agent
   }
 
   /**
-   * Take a fresh session's write ownership when persistence is mounted.
-   * The constructor seed is stored before Session store entry. Setup then
-   * appends through the live event feed; creation failure retains any events
-   * already written to the handle.
-   * @param session - the unpublished session to store.
-   * @param signal - optional cancellation forwarded to the backend create.
-   * @returns the owned handle and stored cursor, or `undefined` without a backend.
+   * Mempertahankan backend yang sama sejak akuisisi hingga rollback atau teardown Agent selesai.
+   * Penolakan publik saat pembatalan tidak melepaskan dependency sebelum operasi backend selesai.
    */
-  private async createStoredSession(session: Session, signal?: AbortSignal): Promise<StoredSession | undefined> {
-    const persistence = this.runtime.ctx.get('sessionPersistence')
-    if (persistence === undefined) return undefined
-    const handle = await persistence.create(session.header, {
-      inheritedEventCount: session.inheritedEventCount,
-      ...signal === undefined ? {} : { signal },
+  private async withPersistence(
+    ownerCtx: Context,
+    id: SessionId,
+    callerSignal: AbortSignal | undefined,
+    operation: (persistence: SessionPersistence | undefined, signal: AbortSignal, beginInitialization: () => void) => Promise<AgentHandle>,
+  ): Promise<AgentHandle> {
+    ownerCtx.fiber.assertActive()
+    if (!this.ownership.isActive()) throw new Error('agent loop is not active')
+    if (this.runtime.ctx.get('sessionPersistence') === undefined) {
+      return operation(undefined, AbortSignal.any([
+        this.ownership.signal, ...callerSignal === undefined ? [] : [callerSignal],
+      ]), () => {})
+    }
+    const abort = new AbortController()
+    const signal = AbortSignal.any([
+      abort.signal, this.ownership.signal, ...callerSignal === undefined ? [] : [callerSignal],
+    ])
+    const unfollowOwner = ownerCtx.effect(() => async () => {
+      abort.abort(new Error(`agent "${id}" setup aborted: owner disposed during setup`))
+      await fiber.dispose()
+      await fiber.await()
+    }, `agentLoop.persistence-owner(${id})`)
+    let pending: Promise<AgentHandle> | undefined
+    const phase = { initializing: false }
+    const fiber = this.runtime.ctx.inject(['sessionPersistence'], (childCtx: Context) => {
+      childCtx.effect(() => async () => {
+        signal.removeEventListener('abort', stop)
+        abort.abort(new Error(`agent "${id}" persistence lifecycle disposed`))
+        // Hanya akuisisi ini yang memiliki fiber; replacement provider tidak menghidupkannya kembali.
+        stop()
+        const handle = await pending?.catch((_acquisitionError: unknown) => {
+          // Promise publik menangani kegagalan akuisisi; rollback melaporkan error cleanup sendiri.
+          return undefined
+        })
+        await handle?.dispose()
+      }, `agentLoop.persistence(${id})`)
+      pending = operation(childCtx.sessionPersistence, signal, () => { phase.initializing = true })
+      this.ownership.trackWrapper(pending)
     })
-    return { handle, storedCount: 0 }
+    const stop = (): void => {
+      void (async () => {
+        await fiber.dispose()
+        await fiber.await()
+        await unfollowOwner()
+      })().catch((error: unknown) => { ownerCtx.logger.error(error) })
+    }
+    signal.addEventListener('abort', stop, { once: true })
+    const published = (async () => {
+      await fiber
+      await raceAbort(undefined, signal, id)
+      if (pending === undefined) throw new Error(`agent "${id}" persistence backend is not active`)
+      return await pending
+    })()
+    this.ownership.trackWrapper(published)
+    try {
+      const handle = await raceAbort(published, signal, id)
+      signal.removeEventListener('abort', stop)
+      return {
+        agent: handle.agent,
+        async dispose() {
+          try {
+            await handle.dispose()
+          } finally {
+            await fiber.dispose()
+            await fiber.await()
+            await unfollowOwner()
+          }
+        },
+      }
+    } catch (error: unknown) {
+      stop()
+      if (phase.initializing) await pending?.catch(() => undefined)
+      if (pending === undefined) await unfollowOwner()
+      throw error
+    }
   }
 
   /**
@@ -715,32 +749,28 @@ export class AgentLoop extends Service implements AgentFactory {
    * @returns the published handle.
    */
   async createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle> {
-    const preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(options.sessionId, {
-      ...options.seed === undefined ? {} : { seed: options.seed },
-      ...options.meta === undefined ? {} : { meta: options.meta },
-      ...options.inheritedEventCount === undefined ? {} : { inheritedEventCount: options.inheritedEventCount },
-    }))
-    const published = (async () => {
-      using ownedPreparation = preparation
-      // raceAbortCall closes a handle that finishes creating after cancellation.
-      const stored = options.signal === undefined
-        ? await this.createStoredSession(ownedPreparation.session)
-        : await raceAbortCall(
-          () => this.createStoredSession(ownedPreparation.session, options.signal),
-          options.signal,
-          options.sessionId,
-          (abandoned) => { void abandoned?.handle.close().catch(() => {}) },
-        )
+    const published = this.withPersistence(ownerCtx, options.sessionId, options.signal, async (persistence, signal, begin) => {
+      using preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(options.sessionId, {
+        ...options.seed === undefined ? {} : { seed: options.seed },
+        ...options.meta === undefined ? {} : { meta: options.meta },
+        ...options.inheritedEventCount === undefined ? {} : { inheritedEventCount: options.inheritedEventCount },
+      }))
+      await raceAbort(undefined, signal, options.sessionId)
+      const handle = await persistence?.create(preparation.session.header, {
+        inheritedEventCount: preparation.session.inheritedEventCount,
+        signal,
+      })
+      begin()
       return await this.initializeAgent(ownerCtx, {
-        session: ownedPreparation.session,
-        stored,
+        session: preparation.session,
+        stored: handle === undefined ? undefined : { handle, storedCount: 0 },
         agentOptions: options.agentOptions ?? {},
         setup: options.setup,
-        signal: options.signal,
+        signal,
         source: 'startup',
         parentAgent: options.parentAgent,
       })
-    })()
+    })
     this.ownership.trackWrapper(published)
     return published
   }
@@ -752,84 +782,46 @@ export class AgentLoop extends Service implements AgentFactory {
    * @returns the published handle.
    */
   async resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle> {
-    const persistence = this.runtime.ctx.get('sessionPersistence')
-    if (persistence === undefined) {
-      throw new Error('cannot resume: session persistence is not configured (load a dsh-session-persistence backend)')
-    }
-    return this.resumeWith(ownerCtx, persistence, options)
-  }
-
-  /** Resume through an explicit persistence handle used by the deferred config path. */
-  private resumeWith(
-    ownerCtx: Context,
-    persistence: SessionPersistence,
-    options: ResumeAgentOptions,
-  ): Promise<AgentHandle> {
     const id = options.resumeSessionId
-    const published = (async () => {
-      // The open and read may outlive their owner: race them against caller
-      // cancellation, owner-fiber unload, and factory teardown so a
-      // never-settling backend cannot pin the identity.
-      const ownerAbort = new AbortController()
-      const unfollowOwner = ownerCtx.effect(() => () => {
-        ownerAbort.abort(new Error(`agent "${id}" setup aborted: owner disposed during setup`))
-      }, `agentLoop.resume-load(${id})`)
-      const fused = AbortSignal.any([
-        ...options.signal === undefined ? [] : [options.signal],
-        ownerAbort.signal,
-        this.ownership.signal,
-      ])
+    const published = this.withPersistence(ownerCtx, id, options.signal, async (persistence, signal, beginInitialization) => {
+      if (persistence === undefined) {
+        throw new Error('cannot resume: session persistence is not configured (load a dsh-session-persistence backend)')
+      }
+      await raceAbort(undefined, signal, id)
       let handle: SessionHandle | undefined
-      let stored: StoredSession | undefined
       let preparation: SessionPreparation | undefined
       try {
-        try {
-          // Taking write ownership FIRST excludes a concurrent resume of the
-          // same id (in this process, a live agent's handle holds the claim).
-          handle = await raceAbortCall(
-            () => persistence.open(id, 'write', { signal: fused }),
-            fused,
-            id,
-            (abandoned) => { void abandoned.close() },
-          )
-          // Semantic crash repair is the agent layer's job: persistence hands
-          // back the physically valid log; an interrupted final turn receives
-          // synthetic closers (missing tool errors, step/end, turn/end) that
-          // are appended through the same handle as an ordinary batch.
-          const coldRead = await handle.read(0, undefined, { signal: fused })
-          fused.throwIfAborted()
-          const persisted = coldRead.events
-          const closers = interruptedTurnClosers(persisted)
-          if (closers.length > 0) await handle.append(closers)
-          preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(id, {
-            seed: [...persisted, ...closers],
-            meta: structuredClone(handle.header),
-            inheritedEventCount: handle.inheritedEventCount,
-            eventState: coldRead.eventState,
-          }))
-          stored = { handle, storedCount: persisted.length + closers.length }
-          await this.appendUnstoredSuffix(stored, preparation.session)
-        } finally {
-          await unfollowOwner()
-        }
-        ownerCtx.fiber.assertActive()
-        if (!this.ownership.isActive()) throw new Error('agent loop is not active')
-        const owned = stored
-        handle = undefined // initializeAgent owns the write handle through rollback and teardown.
+        handle = await persistence.open(id, 'write', { signal })
+        await raceAbort(undefined, signal, id)
+        const coldRead = await handle.read(0, undefined, { signal })
+        await raceAbort(undefined, signal, id)
+        const persisted = coldRead.events
+        const closers = interruptedTurnClosers(persisted)
+        if (closers.length > 0) await handle.append(closers)
+        preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(id, {
+          seed: [...persisted, ...closers],
+          meta: structuredClone(handle.header),
+          inheritedEventCount: handle.inheritedEventCount,
+          eventState: coldRead.eventState,
+        }))
+        const stored = { handle, storedCount: persisted.length + closers.length }
+        await this.appendUnstoredSuffix(stored, preparation.session)
+        handle = undefined
+        beginInitialization()
         return await this.initializeAgent(ownerCtx, {
           session: preparation.session,
-          stored: owned,
+          stored,
           agentOptions: options.agentOptions ?? {},
           setup: options.setup,
-          signal: options.signal,
+          signal,
           source: 'resume',
           parentAgent: options.parentAgent,
         })
       } finally {
         preparation?.[Symbol.dispose]()
-        await handle?.close().catch(() => {})
+        await handle?.close().catch((error: unknown) => { ownerCtx.logger.error(error) })
       }
-    })()
+    })
     this.ownership.trackWrapper(published)
     return published
   }

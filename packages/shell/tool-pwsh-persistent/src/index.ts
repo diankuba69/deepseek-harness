@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { truncateWithoutSplittingSurrogatePair } from '@deepseek-ai/dsh-output-retention'
+import { TextRetainer, truncateWithoutSplittingSurrogatePair } from '@deepseek-ai/dsh-output-retention'
 import type { TerminalReadResult, TerminalSessionId } from '@deepseek-ai/dsh-terminal'
 import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -18,6 +18,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 // TODO: Replace the file-search advice; arbitrary command output need not come from a searchable file.
 const TRUNCATED_MESSAGE = '<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with Select-String in order to find the line numbers of what you are looking for.</NOTE>'
 const LOST_PREFIX_MESSAGE = '<response clipped><NOTE>The beginning of this command output was dropped by the terminal scrollback limit. The following text is the earliest retained output.</NOTE>\n'
+const FALLBACK_TAIL_MESSAGE = '<response clipped><NOTE>The beginning of this command output was dropped by the fallback retention limit. The following text is the retained tail.</NOTE>\n'
 const SHELL_RESET_MESSAGE = 'The persistent pwsh shell was reset; the next pwsh call starts from the workspace with a fresh current directory and environment.'
 const TIMEOUT_CODE = 'PERSISTENT_PWSH_TIMEOUT'
 // One page is enough to find a just-emitted completion marker; the full
@@ -47,12 +48,65 @@ interface RetainedOutput {
 interface CapturedOutput {
   text: string
   incomplete: boolean
+  retainedTail?: boolean
   exitCode?: number
 }
 
 interface PersistentShells {
   get(owner: Agent, signal: AbortSignal): Promise<TerminalSessionId>
   reset(owner: Agent, reason: string): Promise<void>
+}
+
+/** Retensi fallback satu command; carry hanya menahan calon END dan pasangan surrogate. */
+class FallbackOutput {
+  private retainer: TextRetainer
+  private carry = ''
+  private ended = false
+  private readonly maxBytes: number
+
+  constructor(private readonly marker: CommandMarkers, private readonly maxOutputChars: number) {
+    const overhead = marker.start.length + marker.end.length + 4
+    this.maxBytes = Math.min(Number.MAX_SAFE_INTEGER, 3 * maxOutputChars + overhead)
+    this.retainer = new TextRetainer({ kind: 'tail', maxBytes: this.maxBytes })
+  }
+
+  push(text: string, replace: boolean): void {
+    if (replace) {
+      this.retainer = new TextRetainer({ kind: 'tail', maxBytes: this.maxBytes })
+      this.carry = ''
+      this.ended = false
+    }
+    if (this.ended) return
+    const input = this.carry + text
+    this.carry = ''
+    let end = input.indexOf(this.marker.end)
+    while (end >= 0) {
+      const afterEnd = end + this.marker.end.length
+      if (input.charAt(afterEnd) !== "'") {
+        this.retainer.push(input.slice(0, end))
+        this.ended = afterEnd < input.length
+        this.carry = this.ended ? '' : this.marker.end
+        return
+      }
+      // Echo wrapper selalu memakai kutip sesudah nonce END.
+      end = input.indexOf(this.marker.end, afterEnd)
+    }
+    let cut = Math.max(0, input.length - this.marker.end.length + 1)
+    if (cut > 0 && /[\uDC00-\uDFFF]/.test(input.charAt(cut))) cut--
+    this.retainer.push(input.slice(0, cut))
+    // Salinan kecil tidak mempertahankan backing string delta yang besar.
+    this.carry = input.slice(cut).split('').join('')
+  }
+
+  finish(): RetainedOutput {
+    if (this.carry !== this.marker.end) this.retainer.push(this.carry)
+    this.carry = ''
+    const retained = this.retainer.finish()
+    if (!retained.truncated || retained.text.includes(this.marker.start)) return retained
+    let start = Math.max(0, retained.text.length - this.maxOutputChars)
+    if (/[\uDC00-\uDFFF]/.test(retained.text.charAt(start))) start++
+    return { text: retained.text.slice(start), truncated: true }
+  }
 }
 
 function maybeTruncate(content: string, maxOutputChars: number, incomplete = false): string {
@@ -132,7 +186,7 @@ function partialOutput(
   snapshot: RetainedOutput,
   marker: CommandMarkers,
   wrapper: string,
-  fallback: string,
+  fallback: FallbackOutput,
   fallbackTruncated = false,
 ): CapturedOutput {
   const startMarker = snapshot.text.lastIndexOf(marker.start)
@@ -142,15 +196,17 @@ function partialOutput(
       incomplete: false,
     }
   }
-  const fallbackStart = fallback.lastIndexOf(marker.start)
+  const retained = fallback.finish()
+  const fallbackStart = retained.text.lastIndexOf(marker.start)
   const afterStart = fallbackStart < 0
-    ? fallback
-    : fallback.slice(fallbackStart + marker.start.length).replace(/^\r?\n/, '')
+    ? retained.text
+    : retained.text.slice(fallbackStart + marker.start.length).replace(/^\r?\n/, '')
   const fallbackEnd = afterStart.lastIndexOf(marker.end)
   const beforeEnd = fallbackEnd < 0 ? afterStart : afterStart.slice(0, fallbackEnd)
   return {
     text: trimTrailingNewline(beforeEnd.replaceAll(wrapper, '')),
     incomplete: fallbackTruncated || fallbackStart < 0,
+    retainedTail: retained.truncated && fallbackStart < 0,
   }
 }
 
@@ -187,7 +243,7 @@ function retainedScrollback(
 function renderCaptured(output: CapturedOutput, maxOutputChars: number): string {
   const rendered = maybeTruncate(output.text, maxOutputChars, output.incomplete)
   const withPrefix = output.incomplete && output.text.length > 0
-    ? LOST_PREFIX_MESSAGE + rendered
+    ? (output.retainedTail ? FALLBACK_TAIL_MESSAGE : LOST_PREFIX_MESSAGE) + rendered
     : rendered
   const marker = output.exitCode !== undefined && output.exitCode !== 0
     ? `[exit code: ${output.exitCode}]`
@@ -228,7 +284,7 @@ async function respondToSessionExit(
   status: { exitCode: number | null; signal: NodeJS.Signals | null },
   marker: CommandMarkers,
   wrapped: string,
-  fallback: string,
+  fallback: FallbackOutput,
   fallbackTruncated: boolean,
   config: ResolvedConfig,
 ): Promise<string> {
@@ -327,7 +383,7 @@ async function executeCommand(
   const marker = markers()
   const wrapped = wrapCommand(command, marker)
   let first = true
-  let fallback = ''
+  const fallback = new FallbackOutput(marker, config.maxOutputChars)
   let fallbackTruncated = false
 
   while (true) {
@@ -356,7 +412,7 @@ async function executeCommand(
       throw error
     }
     const incremental = operation.readOutput()
-    fallback = incremental.delta.length > 0 ? fallback + incremental.delta : result.viewport
+    fallback.push(incremental.delta.length > 0 ? incremental.delta : result.viewport, incremental.delta.length === 0)
     fallbackTruncated ||= incremental.truncated || result.truncated
     const latest = ctx.terminals.read(owner, id, { offset: 0, count: SCROLLBACK_PAGE_LINES })
     const timedOut = timeoutOf(commandDeadline.signal, TIMEOUT_CODE)

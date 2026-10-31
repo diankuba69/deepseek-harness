@@ -8,23 +8,21 @@ Status: proposed
 
 一个 disposer（清理函数）可能仍在等待消费者，另一个 disposer 却已经移除消费者需要的监听器或关闭资源。因此，等待 provider（提供者）的最终释放 promise，不能保证资源在此期间一直可用。这会影响关闭与插件替换，包括最终 Session 事件、已接受的提醒投递、凭据提交和远程进程终止。
 
-[Cordis 审查 skill](../../../skills/cordis-styling-nitpicking/SKILL.md#p0-cleanup-dependency-released-before-consumer-completion) 将这种生命周期违规归为 P0。[Fiber 卸载 (`Fiber._unload`)](../../../../vendor/cordis/src/fiber.ts) 并发启动同级 disposer；[服务撤销 (`ReflectService.provide`)](../../../../vendor/cordis/src/reflect.ts) 仅在自己的 disposer 内等待依赖 fiber。服务注入建立依赖追踪，却不能阻止同级资源关闭。[事件订阅 (`EventsService.register`)](../../../../vendor/cordis/src/events.ts) 是独立拥有的 effect，包括通过追踪调用方的服务上下文建立的订阅。
+[Cordis 审查 skill](../../../skills/cordis-styling-nitpicking/SKILL.md#p0-cleanup-dependency-released-before-consumer-completion) 将这种生命周期违规归为 P0。固定版本的 [Fiber 卸载 (`Fiber._unload`)](../../../../vendor/cordis/src/fiber.ts) 在释放 provider fiber 的 effect 前，会保留声明的实现依赖者直到其全部清理完成，包括并发根释放。同级或父 effect 拥有的资源仍需与服务撤销显式组合。[事件订阅 (`EventsService.register`)](../../../../vendor/cordis/src/events.ts) 是独立拥有的 effect，包括通过追踪调用方的服务上下文建立的订阅。
 
 ## 提案
 
 让每项必需资源的所有者，在消费者完成全部异步清理之前保留该资源。停止接收新工作，完成已接受的工作和最终发布，然后排空并释放资源。将实际 disposer 组合成明确等待的所有权顺序；返回包装函数不能收纳独立注册的原始 effect。保留取消和错误报告，同时保证一次失败不会绕过余下清理。
 
-以下审查记录了 2026-10-09 检查到的未解决生产路径。它提出后续实现工作；本 Note 和 skill 不修复运行时行为。发现仅针对清理依赖规则，不覆盖 skill 中独立的单例与未撤销副作用规则。
+以下审查记录了 2026-10-09 检查到的生产路径。Session 生命周期要求已实现；其他领域仍为提案，该修复没有重新审查它们。发现仅针对清理依赖规则，不覆盖 skill 中独立的单例与未撤销副作用规则。
 
 ## P0 发现
 
-### Session 持久化丢失清理期间发出的事件
+### Session 持久化生命周期已实现
 
-**所有者与证据。** [JSONL 插件 (`apply`)](../../../../packages/session/session-persistence-jsonl/src/index.ts)通过组合清理，先撤回服务，再释放追踪器。[追踪器 (`JsonlBackendTracker.install`)](../../../../packages/session/session-persistence-jsonl/src/storage.ts)先移除实时事件监听器，再关闭句柄。这能保护由 provider 撤回触发卸载的消费方，但根资源并发释放可能在服务撤回发现消费方 fiber 之前，就已将其注销；插件明确不保证这种情形的释放顺序。Agent loop [取消运行，等待 idle 与 scope 释放，然后关闭句柄 (`AgentLoop.prepare`)](../../../../packages/core/agent-loop/src/index.ts)。`AgentLoop.prepare` 的清理注释明确要求后端实时事件监听器在驱动器关闭期间保持挂载，以接收结束事件。其[轮次收尾 (`ReactLoopAgent.turn`)](../../../../packages/core/agent-loop/src/agent.ts)可能在 await 后发布补齐的工具结果与结束事件。
+[Agent 持久化生命周期决定](../../implemented/architecture/2026-10-31-agent-persistence-lifetime.zh.md)从获取开始保留一个注入后端，直到回滚或最终 Agent teardown 完成。结合 JSONL 现有服务与 tracker 组合 effect，它在根释放和 provider 卸载期间保留最终事件路由。聚焦测试比较实时与重新打开的历史、重新获取写所有权，并覆盖迟到获取与清理失败；两种 SDK 快照路径保留被取消子 Agent 的尾部。
 
-**失败与修正。** 根资源释放时，暂停轮次的取消收尾。JSONL 可以先移除路由监听器，并关闭当前已缓冲的前缀，然后轮次才发出最终事件。这些事件进入实时 Session，却从未进入写入器；之后幂等的句柄关闭无法恢复它们。应保留路由、写入器与写所有权，直到所有生产者结束，再执行最终排空。此项由源码追踪确认；仍需完整 Session 复现。
-
-[基于句柄的持久化决定](../../implemented/architecture/2026-08-27-handle-based-session-persistence.zh.md)明确允许根释放期间丢失尚未发出的剩余事件。本提案有意收紧该策略，要求保留有序清理完成期间发出的事件。突然终止仍需要崩溃修复，但修复不能替代被等待的关闭过程中实际最终结果的持久化。[逻辑会话存储提案](2026-09-06-logical-session-storage-rebuild.zh.md)在阶段 4 重新分配入队所有权；它还必须建立这里要求的释放顺序。
+[基于句柄的持久化决定](../../implemented/architecture/2026-08-27-handle-based-session-persistence.zh.md)保留其句柄 API 与存储所有权；其原先允许有序关闭丢失尾部的策略被替代。[逻辑会话存储提案](2026-09-06-logical-session-storage-rebuild.zh.md)若重新分配入队所有权，必须保留此顺序。无需修改 Session 格式或全局串行化 Cordis 释放。
 
 ### Storage 在 Schedule 提交已接受的投递前关闭
 
@@ -68,7 +66,7 @@ Status: proposed
 
 ## 考虑过的替代方案
 
-**增加注入或逆转 disposer 注册顺序。** 依赖撤销已经等待消费者，而逆序调用仍会并发启动同级异步清理。两者都无法保证资源跨越消费者 await 持续可用。
+**不检查资源所有权就增加注入，或逆转 disposer 注册顺序。** 注入保留实际服务实现直到消费者结束。JSONL 已将资源释放组合在服务撤销之后，因此它可以解决 Session 消费者生命周期；但它不能修复被同级或父 effect 独立关闭的资源。仅逆序调用仍会并发启动同级异步清理。
 
 **全局串行化所有 Cordis disposer。** 这会改变无关生命周期，带来依赖死锁风险，并掩盖具体哪些操作需要哪些资源。显式组合可以在局部表达必要顺序。
 
@@ -79,7 +77,7 @@ Status: proposed
 ## 验收标准
 
 - 为每项发现增加受控 promise 回归：在真实消费者最后使用依赖前暂停，开始 provider 或外层所有者释放，放行暂停，并等待操作和释放都完成。验证必需资源与监听器在暂停期间仍然可用，之后确实释放。
-- Session 清理持久化实际发出的最终后缀，包括工具结果与结束事件；比较实时与恢复后的历史，而不只检查 `close()` 被调用。覆盖 provider 替换和根释放，包括清理失败路径。
+- 在处理其他资源所有者时，保留已实现的 [Session 生命周期保证](../../implemented/architecture/2026-10-31-agent-persistence-lifetime.zh.md)。
 - Schedule 在 flush 到任务提交的间隔中卸载 provider，仍保留成功投递的最终任务状态；重启不会再次投递已完成的这次提醒。保留单独记录的突然崩溃重复投递策略。
 - 成功提交期间释放账号消费者，返回结果应与已存凭据一致。释放凭据 provider 应排空已接受且排队中的提交，并拒绝新准入，不能取消该提交。
 - SSH provider 带存活进程和 PTY 卸载时，先完成依赖者的终止与确认，再关闭请求资源。通过真实 helper 验证远程工作完全停止；测试失败传播，不能仅凭顶层进程退出就声称清理成功。
@@ -90,4 +88,4 @@ Status: proposed
 
 错误组合依赖可能使关闭死锁或无限保留资源。测试即使失败也必须放行受控暂停，实现必须保留现有外部操作时限策略。延长 provider 存活时间可能增加关闭延迟；隐藏清理失败或静默丢弃必需的最终写入不能作为捷径。
 
-聚焦实验隔离了 storage、Authorization、组合 SSH provider 的释放，以及 sandbox 资源释放时序，没有覆盖完整产品组合或原生 Windows 访问。Session、Schedule 后果、凭据队列变体、实际远程进程退出与原生 sandbox 行为仍需上述集成证据，才能认定修复完成。监听器所有权跟随实际调用方上下文，因此只将清理移动到 provider 对象，而不转移其 effect 所有权，可能仍会保留竞态。
+聚焦实验隔离了 storage、Authorization、组合 SSH provider 的释放，以及 sandbox 资源释放时序，没有覆盖完整产品组合或原生 Windows 访问。Schedule 后果、凭据队列变体、实际远程进程退出与原生 sandbox 行为仍需上述集成证据，才能认定修复完成。监听器所有权跟随实际调用方上下文，因此只将清理移动到 provider 对象，而不转移其 effect 所有权，可能仍会保留竞态。

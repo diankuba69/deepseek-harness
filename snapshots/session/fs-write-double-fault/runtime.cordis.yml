@@ -1,0 +1,3 @@
+- insert:
+    - id: fs-write-double-fault
+      name: './inject-write-fault.ts'

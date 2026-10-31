@@ -279,7 +279,8 @@
 
 @media (hover: hover) {
   .projectRow:hover .rowActions,
-  .searchResultRow:hover .rowActions {
+  .searchResultRow:hover .rowActions,
+  :global(html[data-input-modality='keyboard']) .searchResultRow:focus-within .rowActions {
     display: inline-flex;
   }
 }

@@ -143,6 +143,10 @@ with DeepSeekHarness(
 
 `NotificationSubscription.next(timeout_seconds=...)` 限制单次本地通知等待，超时抛出 `TimeoutError`；省略参数则无限等待。超时不取消运行时工作，也不关闭订阅，后续调用仍可接收通知。
 
+`NotificationSubscription.close()` 丢弃已排队的通知，并唤醒所有等待中的读取。关闭活动订阅会设置 `TransportClosedError`；若此前已有终止错误，则保持该错误。运行时终止会保留已排队的通知，供 `next()` 或 `drain()` 读取；队列耗尽后，这两个方法持续抛出首次终止错误。过滤器失败时，仅以该错误终止自身订阅。`drain()` 调用回调时不持有订阅锁。
+
+运行时终止后创建的订阅会立即失败。在调用 `HarnessClient.close()` 和 `start()` 后，请为新运行时创建新订阅；旧订阅保持终止状态。
+
 `HarnessClient` 会在运行时进程的整个生命周期内保留已发现的 subagent 谱系。在 `Session.run()` 期间，`RunResult.notifications` 与 `on_notification` 按协议顺序接收根会话和已知后代的通知。`RunResult.events` 只包含根会话事件，因此后代输出不会替换根响应。底层 `session_prompt()` 会立即返回已排队消息的 id；绕过 `Session.run()` 的调用方自行负责后续活动边界。
 
 所选 home 保存 profile、插件与每个 profile 自有的持久资源。完整 `sdk` profile 使用其中的凭据、设置与会话存储；`sdk-minimal` 保存 JSONL 会话，将图片存储在 `$DSH_HOME/attachments/v1` 下，请求图片缓存位于 `$DSH_HOME/cache/attachments` 下。需要隔离这些资源时应使用新的 home；独立工作应使用新的会话 ID。同时复用 harness 与会话 ID 会延续持久对话和会话资源。
